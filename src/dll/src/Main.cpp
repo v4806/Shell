@@ -399,6 +399,7 @@ constexpr auto TaskListSubclassProp = L"ShellTaskListSubclass";
 // Shell 会抓快照并按自己的主题重绘 → 菜单变成 Shell 样式，而内容由我们决定。
 struct taskbar_button_info
 {
+	bool is_button{};   // 只有点在真正的应用按钮上才为 true
 	// 注意：UIA 对任务栏按钮返回的 pid 是 shell 进程，不是应用进程，不能用来定位窗口
 	int pid{};
 	HWND window{};
@@ -417,6 +418,13 @@ static taskbar_button_info query_taskbar_button(const Point &pt)
 	if(FAILED(taskbar_t::_IUIAutomation->ElementFromPoint(pt, elem)) || !elem)
 		return out;
 
+	// MSTaskListWClass 覆盖整个按钮区（含按钮之间的空白）。只有 ControlType 是 Button
+	// 才当成「应用按钮」；点在空白处必须放行，让 explorer 弹它自己的任务栏菜单（Shell 会接管）。
+	CONTROLTYPEID ctype = 0;
+	elem->get_CurrentControlType(&ctype);
+	if(ctype != UIA_ButtonControlTypeId)
+		return out;
+
 	BSTR name = nullptr;
 	elem->get_CurrentName(&name);
 	if(name)
@@ -427,6 +435,7 @@ static taskbar_button_info query_taskbar_button(const Point &pt)
 	int epid = 0;
 	elem->get_CurrentProcessId(&epid);
 	out.pid = epid;
+	out.is_button = !out.title.empty();
 	return out;
 }
 
@@ -441,8 +450,6 @@ struct taskbar_window_finder
 static BOOL CALLBACK find_app_window_proc(HWND hWnd, LPARAM lParam)
 {
 	auto f = reinterpret_cast<taskbar_window_finder *>(lParam);
-	if(f->hwnd)
-		return FALSE;
 	if(!::IsWindowVisible(hWnd) || ::GetWindow(hWnd, GW_OWNER))
 		return TRUE;
 	if(::GetWindowLongPtrW(hWnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)
@@ -459,44 +466,51 @@ static BOOL CALLBACK find_app_window_proc(HWND hWnd, LPARAM lParam)
 	wchar_t key[256]{};
 	::wcsncpy_s(key, 256, btn, n);
 
-	// 1) 标题精确匹配（如 "任务管理器"）
+	bool matched = false;
+	// 1) 标题精确  2) 标题包含
 	if(tlen > 0 && ::_wcsicmp(title, key) == 0)
+		matched = true;
+	else if(tlen > 0 && ::wcsstr(title, key))
+		matched = true;
+	else
 	{
-		f->hwnd = hWnd;
-		return FALSE;
-	}
-
-	// 2) 标题包含（如浏览器 "<页面标题> — DeepSeek Harness"）
-	if(tlen > 0 && ::wcsstr(title, key))
-	{
-		f->hwnd = hWnd;
-		return FALSE;
-	}
-
-	// 3) 进程名相同（如 QQ.exe / WeChat.exe；按钮名就是进程名）
-	DWORD pid = 0;
-	::GetWindowThreadProcessId(hWnd, &pid);
-	if(pid)
-	{
-		wchar_t path[MAX_PATH]{};
-		if(HANDLE hProcess = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid))
+		// 3) 进程名相同（QQ.exe / WeChat.exe …）
+		DWORD pid = 0;
+		::GetWindowThreadProcessId(hWnd, &pid);
+		if(pid)
 		{
-			DWORD size = MAX_PATH;
-			if(::QueryFullProcessImageNameW(hProcess, 0, path, &size))
+			wchar_t path[MAX_PATH]{};
+			if(HANDLE hProcess = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid))
 			{
-				const wchar_t *file = ::wcsrchr(path, L'\\');
-				file = file ? file + 1 : path;
-				wchar_t base[MAX_PATH]{};
-				::wcsncpy_s(base, MAX_PATH, file, MAX_PATH);
-				if(wchar_t *dot = ::wcsrchr(base, L'.'))
-					*dot = 0;
-				if(::_wcsicmp(base, key) == 0)
-					f->hwnd = hWnd;
+				DWORD size = MAX_PATH;
+				if(::QueryFullProcessImageNameW(hProcess, 0, path, &size))
+				{
+					const wchar_t *file = ::wcsrchr(path, L'\\');
+					file = file ? file + 1 : path;
+					wchar_t base[MAX_PATH]{};
+					::wcsncpy_s(base, MAX_PATH, file, MAX_PATH);
+					if(wchar_t *dot = ::wcsrchr(base, L'.'))
+						*dot = 0;
+					matched = ::_wcsicmp(base, key) == 0;
+				}
+				::CloseHandle(hProcess);
 			}
-			::CloseHandle(hProcess);
 		}
 	}
-	return f->hwnd ? FALSE : TRUE;
+
+	if(!matched)
+		return TRUE;
+
+	// 优先非最小化的窗口：UWP 应用常同时有「最小化的 ApplicationFrameWindow」和
+	// 「真正显示中的 CoreWindow」，EndTask 只对后者有效（实测）。
+	if(!::IsIconic(hWnd))
+	{
+		f->hwnd = hWnd;
+		return FALSE;
+	}
+	if(!f->hwnd)
+		f->hwnd = hWnd;   // 全是最小化的才退回用它
+	return TRUE;
 }
 
 static HWND find_app_window(string const &button_name)
@@ -509,14 +523,50 @@ static HWND find_app_window(string const &button_name)
 	return f.hwnd;
 }
 
-static void show_taskbar_button_menu(HWND hWnd, const Point &pt)
+// 「关闭窗口」= 请求窗口关闭，**不是结束进程**（结束进程会丢数据、应用没机会保存）。
+//   1) UIA 的 WindowPattern.Close()：标准「关闭窗口」语义（等同用户点标题栏 ×，应用可弹保存/取消）。
+//      UWP / 现代应用只认这条 —— 实测「设置」窗口对 WM_CLOSE、WM_SYSCOMMAND/SC_CLOSE、
+//      SendMessage(WM_CLOSE) 三种传统发法全部无响应。
+//   2) 普通 Win32 窗口兜底：WM_CLOSE。
+// UIA 调用可能较慢，放后台线程，避免卡住 explorer 的 UI 线程。
+static bool close_window_via_uia(HWND hWnd)
 {
-	auto info = query_taskbar_button(pt);
-	if(!info.pid)
+	if(!hWnd || !taskbar_t::_IUIAutomation)
+		return false;
+
+	IComPtr<IUIAutomationElement> elem;
+	if(FAILED(taskbar_t::_IUIAutomation->ElementFromHandle(hWnd, elem)) || !elem)
+		return false;
+
+	IUnknown *unk = nullptr;
+	if(FAILED(elem->GetCurrentPattern(UIA_WindowPatternId, &unk)) || !unk)
+		return false;
+
+	bool ok = false;
+	IUIAutomationWindowPattern *wp = nullptr;
+	if(SUCCEEDED(unk->QueryInterface(__uuidof(IUIAutomationWindowPattern), reinterpret_cast<void **>(&wp))) && wp)
 	{
-		_log.info(L"[BTN] no pid at (%d,%d)", pt.x, pt.y);
-		return;
+		ok = SUCCEEDED(wp->Close());
+		wp->Release();
 	}
+	unk->Release();
+	return ok;
+}
+
+static void close_app_window_async(HWND hWnd)
+{
+	if(!hWnd)
+		return;
+	std::thread([hWnd]()
+	{
+		if(close_window_via_uia(hWnd))
+			return;
+		::PostMessageW(hWnd, WM_CLOSE, 0, 0);
+	}).detach();
+}
+
+static void show_taskbar_button_menu(HWND hWnd, const Point &pt, taskbar_button_info &info)
+{
 	info.window = find_app_window(info.title);
 
 	HMENU menu = ::CreatePopupMenu();
@@ -562,7 +612,7 @@ static void show_taskbar_button_menu(HWND hWnd, const Point &pt)
 		if(!target)
 			target = info.window;
 		_log.info(L"[BTN] close window=0x%x target=0x%x", (unsigned)(ULONG_PTR)info.window, (unsigned)(ULONG_PTR)target);
-		::PostMessageW(target, WM_SYSCOMMAND, SC_CLOSE, 0);
+		close_app_window_async(target);
 	}
 	else if(cmd == id_pin)
 	{
@@ -602,9 +652,12 @@ LRESULT __stdcall TaskListProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 		case WM_CONTEXTMENU:
 		{
 			auto pt = Point::CursorPos();
+			auto info = query_taskbar_button(pt);
+			if(!info.is_button)
+				break;   // 按钮之间的空白：放行，走 explorer/Shell 原有的任务栏菜单
 			_log.info(L"[BTN] WM_CONTEXTMENU cursor=(%d,%d)", pt.x, pt.y);
-			show_taskbar_button_menu(hWnd, pt);
-			return 0;   // 吞掉，阻止 ShellExperienceHost 的 XAML 跳转列表
+			show_taskbar_button_menu(hWnd, pt, info);
+			return 0;   // 只对真正的应用按钮吞掉，阻止 XAML 跳转列表
 		}
 	}
 	return ::CallWindowProcW(proc, hWnd, uMsg, wParam, lParam);

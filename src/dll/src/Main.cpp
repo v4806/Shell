@@ -1411,6 +1411,7 @@ static void show_taskbar_button_menu(HWND hWnd, const Point &pt, taskbar_button_
 	const UINT id_pin = 0x1001;
 	const UINT id_close = 0x1002;
 	const UINT id_unpin = 0x1003;
+	const UINT id_activate = 0x1004;   // 应用名那一项：点击 = 激活窗口（没运行则启动程序）
 
 	// 源码文件无 BOM，MSVC 按 GBK(936) 解析源文件，中文字面量必须用 \u 转义，
 	// 否则会乱码："固定到任务栏" → "鏁哄畾鍒颁换鍔℃爮"
@@ -1420,7 +1421,9 @@ static void show_taskbar_button_menu(HWND hWnd, const Point &pt, taskbar_button_
 	const wchar_t *text_close_all = L"\u5173\u95ED\u6240\u6709\u7A97\u53E3";                 // 关闭所有窗口
 
 	auto title = info.title.empty() ? string(L"Application") : info.title;
-	::AppendMenuW(menu, MF_STRING, 0, title.c_str());
+	// 应用名那一项是**可点**的：有运行窗口就把它切到前台（等同点任务栏按钮），
+	// 没在运行就启动程序。以前这里 id 写 0，点了没有任何反应。
+	::AppendMenuW(menu, MF_STRING, id_activate, title.c_str());
 	::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
 	// 固定 / 取消固定：按当前是否已固定决定显示哪个，并记下 exe / 固定项 .lnk 给动作分支用
@@ -1490,7 +1493,42 @@ static void show_taskbar_button_menu(HWND hWnd, const Point &pt, taskbar_button_
 
 	_log.info(L"[BTN] command=%d", static_cast<int>(cmd));
 
-	if(cmd == id_close && !close_targets.empty())
+	if(cmd == id_activate)
+	{
+		_log.info(L"[BTN] activate window=0x%x exe='%s'", (unsigned)(ULONG_PTR)info.window, exe_path);
+		if(info.window)
+		{
+			if(::IsIconic(info.window))
+				::ShowWindow(info.window, SW_RESTORE);
+			if(!::SetForegroundWindow(info.window))
+			{
+				// 前台锁（foreground lock）会拒绝 SetForegroundWindow：
+				// 临时把输入队列接到当前前台线程，再试一次。
+				if(auto fg = ::GetForegroundWindow())
+				{
+					const auto tid_fg = ::GetWindowThreadProcessId(fg, nullptr);
+					const auto tid_me = ::GetCurrentThreadId();
+					if(tid_fg && tid_fg != tid_me)
+					{
+						::AttachThreadInput(tid_me, tid_fg, TRUE);
+						::SetForegroundWindow(info.window);
+						::AttachThreadInput(tid_me, tid_fg, FALSE);
+					}
+				}
+			}
+		}
+		else
+		{
+			// 没在运行：启动它。有固定项 .lnk 就优先走 lnk（能带上原有的工作目录/参数）。
+			const wchar_t *target = has_pinned_lnk ? pinned_lnk : (has_exe ? exe_path : nullptr);
+			if(target)
+			{
+				_log.info(L"[BTN] launch '%s'", target);
+				::ShellExecuteW(nullptr, nullptr, target, nullptr, nullptr, SW_SHOWNORMAL);
+			}
+		}
+	}
+	else if(cmd == id_close && !close_targets.empty())
 	{
 		// UWP 应用（设置 / 商店等）里层的 Windows.UI.Core.CoreWindow 不响应 SC_CLOSE，
 		// 必须把关闭消息发给顶层宿主（ApplicationFrameWindow）—— 上面已按 GA_ROOT 收敛过。

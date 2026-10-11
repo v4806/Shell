@@ -586,6 +586,79 @@ static HWND find_app_window(string const &button_name)
 	return f.hwnd;
 }
 
+// 调用 shell 上下文菜单里的某个动词（按语言无关的规范名，如 "TaskbarPin"）。
+//
+// 为什么不能直接用 ShellExecuteEx(verb)：
+//   Win10 上 "TaskbarPin" 这个动词虽然存在，但程序化调用会被**静默忽略**
+//   （老的 "pin to taskbar" 更是直接 ERROR_NO_ASSOCIATION）——微软的「用户意图」保护。
+//   文件资源管理器里点「固定到任务栏」能生效，是因为 explorer 走的是 IContextMenu::InvokeCommand。
+//   本函数复刻这条路径，所以能真正固定。
+static bool invoke_shell_verb(const wchar_t *path, const wchar_t *verb_name)
+{
+	if(!path || !verb_name)
+		return false;
+
+	PIDLIST_ABSOLUTE pidl = nullptr;
+	if(FAILED(::SHParseDisplayName(path, nullptr, &pidl, 0, nullptr)) || !pidl)
+		return false;
+
+	bool ok = false;
+	IShellFolder *parent = nullptr;
+	PCUITEMID_CHILD child = nullptr;
+	if(SUCCEEDED(::SHBindToParent(pidl, IID_IShellFolder, reinterpret_cast<void **>(&parent), &child)) && parent)
+	{
+		IContextMenu *cm = nullptr;
+		if(SUCCEEDED(parent->GetUIObjectOf(nullptr, 1, &child, IID_IContextMenu, nullptr, reinterpret_cast<void **>(&cm))) && cm)
+		{
+			HMENU menu = ::CreatePopupMenu();
+			if(menu && SUCCEEDED(cm->QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL)))
+			{
+				int count = ::GetMenuItemCount(menu);
+				for(int i = 0; i < count; ++i)
+				{
+					UINT id = ::GetMenuItemID(menu, i);
+					if(id == 0 || id == static_cast<UINT>(-1))
+						continue;
+
+					wchar_t verb[128]{};
+					if(SUCCEEDED(cm->GetCommandString(id - 1, GCS_VERBW, nullptr, reinterpret_cast<char *>(verb), 128)))
+					{
+						if(::_wcsicmp(verb, verb_name) == 0)
+						{
+							CMINVOKECOMMANDINFOEX ci{};
+							ci.cbSize = sizeof(ci);
+							ci.fMask = CMIC_MASK_UNICODE | CMIC_MASK_FLAG_NO_UI;
+							ci.lpVerb = MAKEINTRESOURCEA(id - 1);
+							ci.lpVerbW = MAKEINTRESOURCEW(id - 1);
+							ci.nShow = SW_SHOWNORMAL;
+							ok = SUCCEEDED(cm->InvokeCommand(reinterpret_cast<LPCMINVOKECOMMANDINFO>(&ci)));
+							break;
+						}
+					}
+				}
+			}
+			if(menu)
+				::DestroyMenu(menu);
+			cm->Release();
+		}
+		parent->Release();
+	}
+	::CoTaskMemFree(pidl);
+	return ok;
+}
+
+// 后台线程里跑：QueryContextMenu 会加载一堆 shell 扩展，别拖住 explorer 的 UI 线程
+static void pin_to_taskbar_async(string path)
+{
+	std::thread([path]()
+	{
+		::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+		bool ok = invoke_shell_verb(path.c_str(), L"TaskbarPin");
+		_log.info(L"[BTN] TaskbarPin '%s' -> %s", path.c_str(), ok ? L"ok" : L"failed");
+		::CoUninitialize();
+	}).detach();
+}
+
 // 「关闭窗口」= 请求窗口关闭，**不是结束进程**（结束进程会丢数据、应用没机会保存）。
 //   1) UIA 的 WindowPattern.Close()：标准「关闭窗口」语义（等同用户点标题栏 ×，应用可弹保存/取消）。
 //      UWP / 现代应用只认这条 —— 实测「设置」窗口对 WM_CLOSE、WM_SYSCOMMAND/SC_CLOSE、
@@ -679,26 +752,25 @@ static void show_taskbar_button_menu(HWND hWnd, const Point &pt, taskbar_button_
 	}
 	else if(cmd == id_pin)
 	{
+		// 注意：不能用 info.pid —— UIA 对任务栏按钮返回的是 shell 进程的 pid，
+		// 必须从找到的应用窗口反查进程，才能拿到正确的 exe 路径。
+		DWORD pid = 0;
+		if(info.window)
+			::GetWindowThreadProcessId(info.window, &pid);
 		wchar_t path[MAX_PATH]{};
-		if(auto hProcess = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(info.pid)))
+		if(pid)
 		{
-			DWORD size = MAX_PATH;
-			if(!::QueryFullProcessImageNameW(hProcess, 0, path, &size))
-				path[0] = 0;
-			::CloseHandle(hProcess);
+			if(HANDLE hProcess = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid))
+			{
+				DWORD size = MAX_PATH;
+				if(!::QueryFullProcessImageNameW(hProcess, 0, path, &size))
+					path[0] = 0;
+				::CloseHandle(hProcess);
+			}
 		}
 		_log.info(L"[BTN] pin '%s'", path);
 		if(path[0])
-		{
-			SHELLEXECUTEINFOW sei{};
-			sei.cbSize = sizeof(sei);
-			sei.fMask = SEE_MASK_INVOKEIDLIST | SEE_MASK_FLAG_NO_UI;
-			sei.lpVerb = L"pin to taskbar";
-			sei.lpFile = path;
-			sei.nShow = SW_SHOWNORMAL;
-			if(!::ShellExecuteExW(&sei))
-				_log.info(L"[BTN] pin failed err=%d", (int)::GetLastError());
-		}
+			pin_to_taskbar_async(path);
 	}
 
 	::DestroyMenu(menu);

@@ -5,6 +5,7 @@
 #include <UIAutomation.h>
 #include <propkey.h>      // PKEY_AppUserModel_ID（固定快捷方式时要用）
 #include <shlobj.h>       // CSIDL_APPDATA / IShellLink
+#include <shobjidl.h>     // IStartMenuPinnedList（官方「从任务栏取消固定」API）
 using namespace Nilesoft::Shell;
 using namespace Diagnostics;
 
@@ -390,6 +391,7 @@ struct taskbar_t
 // ===== Win10 任务栏按钮（MSTaskListWClass）右键接管 =====
 // 前置：这两个符号原本定义/声明在本文件更靠后的位置（约 515 行）
 extern bool is_in_taskbar;
+extern bool in_taskbar_button_menu;
 BOOL WINAPI TrackPopupMenuExProc(HMENU hMenu, uint32_t uFlags, int x, int y, HWND hWnd, LPTPMPARAMS lptpm);
 // 注意：subclass 标记不能沿用 UxSubclass —— ContextMenu::Initialize() 里会用
 // `if(0 == ::GetPropW(hwnd.owner, UxSubclass))` 判断该窗口是否已由 Shell 处理过，
@@ -404,7 +406,8 @@ struct taskbar_button_info
 	bool is_button{};   // 只有点在真正的应用按钮上才为 true
 	// 注意：UIA 对任务栏按钮返回的 pid 是 shell 进程，不是应用进程，不能用来定位窗口
 	int pid{};
-	HWND window{};
+	HWND window{};              // 主窗口（第一个匹配到的，优先非最小化）
+	std::vector<HWND> windows;  // 所有匹配到的窗口：合并按钮要能「关闭所有窗口」
 	string title;   // 形如 "任务管理器 - 1 个运行窗口"
 };
 
@@ -420,11 +423,13 @@ static taskbar_button_info query_taskbar_button(const Point &pt)
 	if(FAILED(taskbar_t::_IUIAutomation->ElementFromPoint(pt, elem)) || !elem)
 		return out;
 
-	// MSTaskListWClass 覆盖整个按钮区（含按钮之间的空白）。只有 ControlType 是 Button
+	// MSTaskListWClass 覆盖整个按钮区（含按钮之间的空白）。只有 ControlType 是按钮类
 	// 才当成「应用按钮」；点在空白处必须放行，让 explorer 弹它自己的任务栏菜单（Shell 会接管）。
+	// ⚠️ 应用有多个窗口（合并按钮）时，UIA 把任务栏按钮暴露成 MenuItem 而不是 Button
+	// （实测 Edge 3 个窗口 → ControlType=MenuItem），只认 Button 会让合并按钮弹回原生跳转列表。
 	CONTROLTYPEID ctype = 0;
 	elem->get_CurrentControlType(&ctype);
-	if(ctype != UIA_ButtonControlTypeId)
+	if(ctype != UIA_ButtonControlTypeId && ctype != UIA_MenuItemControlTypeId && ctype != UIA_SplitButtonControlTypeId)
 		return out;
 
 	BSTR name = nullptr;
@@ -444,7 +449,9 @@ static taskbar_button_info query_taskbar_button(const Point &pt)
 struct taskbar_window_finder
 {
 	string keyword;   // 从按钮名解析出的应用名关键词
-	HWND hwnd{};
+	bool file_explorer{};     // 该按钮是「文件资源管理器」→ 允许用窗口类认窗口（它没有任何 AppUserModel 属性）
+	HWND hwnd{};              // 主窗口（优先非最小化）
+	std::vector<HWND> all;    // 所有匹配到的窗口
 };
 
 // Chromium 系应用（Edge/Chrome）会在窗口标题里插入零宽字符：
@@ -462,6 +469,122 @@ static void normalize_for_match(wchar_t *s)
 		*d++ = (*p == 0x00A0) ? L' ' : *p;
 	}
 	*d = 0;
+}
+
+// 窗口自己带着「这个应用在任务栏里是谁」的完整信息（都是公开属性，不用猜名字）：
+//   AppUserModel.ID                          —— 分组主键
+//   AppUserModel.RelaunchCommand             —— 任务栏算 AppID 也用它。缺了它，固定项会跟运行窗口
+//                                               分成两个图标（实测 Blender：lnk 只有 ID、没这条，
+//                                               target 还是 blender.exe 而窗口 relaunch 是 blender-launcher.exe）
+//   AppUserModel.RelaunchDisplayNameResource —— 任务栏按钮名（实测 Blender 窗口='Blender 5.2'）
+//   AppUserModel.RelaunchIconResource        —— 图标
+struct window_appmodel
+{
+	wchar_t aumid[256]{};
+	wchar_t relaunch_command[1024]{};
+	wchar_t relaunch_display_name[512]{};
+	wchar_t relaunch_icon[512]{};
+};
+
+static void read_prop_str(IPropertyStore *ps, REFPROPERTYKEY key, wchar_t *out, size_t outLen)
+{
+	out[0] = 0;
+	PROPVARIANT pv{};
+	if(SUCCEEDED(ps->GetValue(key, &pv)))
+	{
+		if(pv.vt == VT_LPWSTR && pv.pwszVal)
+			::wcsncpy_s(out, outLen, pv.pwszVal, outLen - 1);
+		::PropVariantClear(&pv);
+	}
+}
+
+static bool get_window_appmodel(HWND hWnd, window_appmodel &out)
+{
+	if(!hWnd)
+		return false;
+	IPropertyStore *ps = nullptr;
+	if(FAILED(::SHGetPropertyStoreForWindow(hWnd, IID_IPropertyStore, reinterpret_cast<void **>(&ps))) || !ps)
+		return false;
+	read_prop_str(ps, PKEY_AppUserModel_ID, out.aumid, 256);
+	read_prop_str(ps, PKEY_AppUserModel_RelaunchCommand, out.relaunch_command, 1024);
+	read_prop_str(ps, PKEY_AppUserModel_RelaunchDisplayNameResource, out.relaunch_display_name, 512);
+	read_prop_str(ps, PKEY_AppUserModel_RelaunchIconResource, out.relaunch_icon, 512);
+	ps->Release();
+	// 注意：AUMID 为空也算成功（explorer 的窗口就是这样，一个属性都不带），
+	// 调用方要自己回退到 exe 路径。
+	return true;
+}
+
+// 查一个应用在 shell:AppsFolder 里的显示名 —— 任务栏按钮名用的就是它。
+// 入参可以写 AppUserModelID（如 Microsoft.Windows.Explorer → 「文件资源管理器」），
+// 也可以写 exe 路径（Blender 没注册 AUMID，按 ...\blender-launcher.exe → 「Blender 5.2」）。
+static bool appsfolder_display_name(const wchar_t *aumid_or_path, wchar_t *out, size_t outLen)
+{
+	out[0] = 0;
+	if(!aumid_or_path || !aumid_or_path[0])
+		return false;
+
+	wchar_t spec[1088]{};
+	::swprintf_s(spec, 1088, L"shell:AppsFolder\\%s", aumid_or_path);
+	IShellItem *item = nullptr;
+	if(FAILED(::SHCreateItemFromParsingName(spec, nullptr, IID_IShellItem, reinterpret_cast<void **>(&item))) || !item)
+		return false;
+
+	bool ok = false;
+	LPWSTR name = nullptr;
+	if(SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY, &name)) && name)
+	{
+		::wcsncpy_s(out, outLen, name, outLen - 1);
+		ok = out[0] != 0;
+		::CoTaskMemFree(name);
+	}
+	item->Release();
+	return ok;
+}
+
+// 这个窗口在任务栏上叫的名字：先按 AUMID 查 AppsFolder，查不到再按 exe 路径查
+static bool window_button_name(HWND hWnd, wchar_t *out, size_t outLen)
+{
+	out[0] = 0;
+	window_appmodel am;
+	get_window_appmodel(hWnd, am);   // 读不到就全是空串，下面按 exe 路径兜底
+	if(am.aumid[0] && appsfolder_display_name(am.aumid, out, outLen))
+		return true;
+
+	DWORD pid = 0;
+	::GetWindowThreadProcessId(hWnd, &pid);
+	if(!pid)
+		return false;
+	HANDLE hp = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if(!hp)
+		return false;
+	wchar_t exe[MAX_PATH]{};
+	DWORD size = MAX_PATH;
+	bool ok = ::QueryFullProcessImageNameW(hp, 0, exe, &size) && appsfolder_display_name(exe, out, outLen);
+	::CloseHandle(hp);
+	return ok;
+}
+
+// 「文件资源管理器」是唯一必须特判的应用：它的窗口**一个 AppUserModel 属性都不带**
+// （实测 AUMID vt=0），`shell:AppsFolder\C:\Windows\explorer.exe` 也查不到（未注册），
+// 而任务栏照样把它显示成「文件资源管理器」/「Windows 资源管理器」—— 那是 Windows 内部规则。
+// 所以这里按名字认按钮，窗口匹配再配合窗口类 CabinetWClass。
+static bool is_file_explorer_button(const wchar_t *button_name)
+{
+	if(!button_name || !button_name[0])
+		return false;
+
+	wchar_t key[256]{};
+	const wchar_t *sep = ::wcsstr(button_name, L" - ");
+	size_t n = sep ? static_cast<size_t>(sep - button_name) : ::wcslen(button_name);
+	if(n == 0 || n >= 256)
+		return false;
+	::wcsncpy_s(key, 256, button_name, n);
+
+	// 运行中按钮名是「文件资源管理器」，固定后被固定项 lnk 的显示名覆盖成「Windows 资源管理器」
+	return ::_wcsicmp(key, L"\u6587\u4EF6\u8D44\u6E90\u7BA1\u7406\u5668") == 0 ||
+		::_wcsicmp(key, L"Windows \u8D44\u6E90\u7BA1\u7406\u5668") == 0 ||
+		::_wcsicmp(key, L"File Explorer") == 0;
 }
 
 // 任务栏按钮的名字形如 "任务管理器 - 1 个运行窗口"，取 " - " 之前的部分作为关键词，
@@ -520,25 +643,48 @@ static BOOL CALLBACK find_app_window_proc(HWND hWnd, LPARAM lParam)
 		}
 	}
 
+	// 4) 用「该窗口在任务栏上叫的名字」匹配：任务栏按钮名就是 shell:AppsFolder 里的显示名
+	//    （窗口 AUMID = Microsoft.Windows.Explorer → 「文件资源管理器」；
+	//     没注册 AUMID 的应用按 exe 路径查，如 ...\blender-launcher.exe → 「Blender 5.2」）。
+	//    这一级完全不看窗口标题，所以标题与按钮名差很远的程序也能认出来。
+	if(!matched)
+	{
+		wchar_t btn_name[512]{};
+		if(window_button_name(hWnd, btn_name, 512))
+		{
+			normalize_for_match(btn_name);
+			matched = ::_wcsicmp(btn_name, key) == 0;
+		}
+	}
+
+	// 5) 兜底：「文件资源管理器」的窗口不带任何 AppUserModel 属性、AppsFolder 也查不到，
+	//    只能按窗口类认（2 个文件夹窗口就是 2 个 CabinetWClass）
+	if(!matched && f->file_explorer)
+	{
+		wchar_t cls[64]{};
+		if(::GetClassNameW(hWnd, cls, 64) > 0 &&
+			(::_wcsicmp(cls, L"CabinetWClass") == 0 || ::_wcsicmp(cls, L"ExploreWClass") == 0))
+			matched = true;
+	}
+
 	if(!matched)
 		return TRUE;
 
-	// 优先非最小化的窗口：UWP 应用常同时有「最小化的 ApplicationFrameWindow」和
-	// 「真正显示中的 CoreWindow」，EndTask 只对后者有效（实测）。
-	if(!::IsIconic(hWnd))
-	{
-		f->hwnd = hWnd;
-		return FALSE;
-	}
+	// 收集**全部**匹配窗口：应用有多个窗口（合并按钮）时要能一次全关。
+	// 主窗口优先取非最小化的：UWP 常同时有「最小化的 ApplicationFrameWindow」和
+	// 「真正显示中的 CoreWindow」，只关前者会没反应（实测）。
+	f->all.push_back(hWnd);
 	if(!f->hwnd)
-		f->hwnd = hWnd;   // 全是最小化的才退回用它
+		f->hwnd = hWnd;
+	// ⚠️ 这里不能像以前那样在找到非最小化窗口时 return FALSE 提前结束枚举，否则窗口收不全
 	return TRUE;
 }
 
-static HWND find_app_window(string const &button_name)
+static void find_app_windows(string const &button_name, std::vector<HWND> &out)
 {
+	out.clear();
 	if(button_name.empty())
-		return nullptr;
+		return;
 
 	// 按钮名形如 "任务管理器 - 1 个运行窗口" / "Microsoft Edge (2) - 1 个运行窗口"。
 	// 先取 " - " 之前的部分；注意还可能带 " (2)" 这类窗口数/配置文件后缀
@@ -548,16 +694,20 @@ static HWND find_app_window(string const &button_name)
 	const wchar_t *sep = ::wcsstr(btn, L" - ");
 	size_t n = sep ? static_cast<size_t>(sep - btn) : ::wcslen(btn);
 	if(n == 0)
-		return nullptr;
+		return;
 	if(n >= 256)
 		n = 255;
 	::wcsncpy_s(key, 256, btn, n);
 
 	taskbar_window_finder f;
 	f.keyword = key;
+	f.file_explorer = is_file_explorer_button(button_name.c_str());
 	::EnumWindows(find_app_window_proc, reinterpret_cast<LPARAM>(&f));
-	if(f.hwnd)
-		return f.hwnd;
+	if(!f.all.empty())
+	{
+		out = f.all;
+		return;
+	}
 
 	// 剥离尾部 " (数字)" 再匹配
 	wchar_t stripped[256]{};
@@ -579,13 +729,21 @@ static HWND find_app_window(string const &button_name)
 			if(digits && *q == L')' && *(q + 1) == 0)
 			{
 				*(p - 1) = 0;
-				f.hwnd = nullptr;
-				f.keyword = stripped;
-				::EnumWindows(find_app_window_proc, reinterpret_cast<LPARAM>(&f));
+				taskbar_window_finder g;
+				g.keyword = stripped;
+				g.file_explorer = f.file_explorer;
+				::EnumWindows(find_app_window_proc, reinterpret_cast<LPARAM>(&g));
+				out = g.all;
 			}
 		}
 	}
-	return f.hwnd;
+}
+
+static HWND find_app_window(string const &button_name)
+{
+	std::vector<HWND> w;
+	find_app_windows(button_name, w);
+	return w.empty() ? nullptr : w.front();
 }
 
 // ===== 任务栏固定 / 取消固定 =====
@@ -600,30 +758,6 @@ static bool taskbar_pinned_dir(wchar_t *out, size_t outLen)
 		return false;
 	::swprintf_s(out, outLen, L"%s\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar", appdata);
 	return true;
-}
-
-// 读窗口的 AppUserModelID
-static bool get_window_aumid(HWND hWnd, wchar_t *out, size_t outLen)
-{
-	out[0] = 0;
-	if(!hWnd)
-		return false;
-	IPropertyStore *ps = nullptr;
-	if(FAILED(::SHGetPropertyStoreForWindow(hWnd, IID_IPropertyStore, reinterpret_cast<void **>(&ps))) || !ps)
-		return false;
-	PROPVARIANT pv{};
-	bool ok = false;
-	if(SUCCEEDED(ps->GetValue(PKEY_AppUserModel_ID, &pv)))
-	{
-		if(pv.vt == VT_LPWSTR && pv.pwszVal)
-		{
-			::wcsncpy_s(out, outLen, pv.pwszVal, outLen - 1);
-			ok = out[0] != 0;
-		}
-		::PropVariantClear(&pv);
-	}
-	ps->Release();
-	return ok;
 }
 
 // 该 .lnk 的目标是否就是这个 exe
@@ -648,7 +782,61 @@ static bool lnk_targets(const wchar_t *lnk_path, const wchar_t *exe_path)
 	return ok;
 }
 
-// 在 User Pinned\TaskBar 里找该 exe 的固定项快捷方式
+// 任务栏真正显示的固定项记录在 HKCU\...\Taskband\Favorites（REG_BINARY）里；
+// User Pinned\TaskBar 目录里的 .lnk 只是素材 —— 被取消固定后文件会残留（幽灵项），
+// 只扫目录会把幽灵误判成「已固定」（实测：目录里有 Microsoft Edge.lnk，Favorites 里没有，
+// 任务栏上也没有 Edge 按钮 → Edge 一运行就被错当成「已固定」）。
+// 这里在 blob 里按 UTF-16LE 搜 lnk 文件名；字符串在 blob 里的偏移奇偶不定，两种对齐都要试。
+static bool is_pinned_lnk_active(const wchar_t *lnk_path)
+{
+	const wchar_t *name = ::wcsrchr(lnk_path, L'\\');
+	name = name ? name + 1 : lnk_path;
+	size_t nlen = ::wcslen(name);
+	if(nlen == 0 || nlen > 128)
+		return false;
+
+	HKEY key = nullptr;
+	if(::RegOpenKeyExW(HKEY_CURRENT_USER,
+		L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Taskband", 0, KEY_READ, &key) != ERROR_SUCCESS)
+		return false;
+
+	DWORD type = 0, size = 0;
+	if(::RegQueryValueExW(key, L"Favorites", nullptr, &type, nullptr, &size) != ERROR_SUCCESS || size < nlen * 2)
+	{
+		::RegCloseKey(key);
+		return false;
+	}
+	std::vector<BYTE> blob(size);
+	bool read = ::RegQueryValueExW(key, L"Favorites", nullptr, &type, blob.data(), &size) == ERROR_SUCCESS;
+	::RegCloseKey(key);
+	if(!read)
+		return false;
+
+	auto fold = [](BYTE c) -> BYTE { return (c >= 'A' && c <= 'Z') ? static_cast<BYTE>(c + 32) : c; };
+
+	for(int align = 0; align < 2; ++align)
+	{
+		for(size_t i = static_cast<size_t>(align); i + nlen * 2 <= size; i += 2)
+		{
+			bool hit = true;
+			for(size_t j = 0; j < nlen; ++j)
+			{
+				const wchar_t wc = name[j];
+				if(fold(blob[i + j * 2]) != fold(static_cast<BYTE>(wc & 0xFF)) ||
+					fold(blob[i + j * 2 + 1]) != fold(static_cast<BYTE>((wc >> 8) & 0xFF)))
+				{
+					hit = false;
+					break;
+				}
+			}
+			if(hit)
+				return true;
+		}
+	}
+	return false;
+}
+
+// 在 User Pinned\TaskBar 里找该 exe 的固定项快捷方式（只认真正在任务栏上的，排除残留幽灵项）
 static bool find_pinned_lnk(const wchar_t *exe_path, wchar_t *out, size_t outLen)
 {
 	wchar_t dir[MAX_PATH]{};
@@ -666,9 +854,173 @@ static bool find_pinned_lnk(const wchar_t *exe_path, wchar_t *out, size_t outLen
 	{
 		wchar_t full[MAX_PATH]{};
 		::swprintf_s(full, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
-		if(lnk_targets(full, exe_path))
+		if(lnk_targets(full, exe_path) && is_pinned_lnk_active(full))
 		{
 			::wcsncpy_s(out, outLen, full, outLen - 1);
+			found = true;
+			break;
+		}
+	} while(::FindNextFileW(h, &fd));
+	::FindClose(h);
+	return found;
+}
+
+// 读 .lnk 的 target 路径。注意有些固定项没有 target（例如「文件资源管理器」的 lnk
+// 只写了 IconLocation=%windir%\explorer.exe），这时返回 false。
+static bool lnk_target(const wchar_t *lnk_path, wchar_t *out, size_t outLen)
+{
+	out[0] = 0;
+	IShellLinkW *link = nullptr;
+	if(FAILED(::CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW, reinterpret_cast<void **>(&link))) || !link)
+		return false;
+	bool ok = false;
+	IPersistFile *pf = nullptr;
+	if(SUCCEEDED(link->QueryInterface(IID_IPersistFile, reinterpret_cast<void **>(&pf))) && pf)
+	{
+		if(SUCCEEDED(pf->Load(lnk_path, STGM_READ)))
+		{
+			wchar_t target[MAX_PATH]{};
+			if(SUCCEEDED(link->GetPath(target, MAX_PATH, nullptr, SLGP_UNCPRIORITY)) && target[0])
+			{
+				::wcsncpy_s(out, outLen, target, outLen - 1);
+				ok = true;
+			}
+		}
+		pf->Release();
+	}
+	link->Release();
+	return ok;
+}
+
+// 读 .lnk 在资源管理器里显示的**本地化名字**（不带扩展名）。
+// 关键用例："File Explorer (2).lnk" 在中文系统上显示为「文件资源管理器」，
+// 而任务栏按钮名用的就是这个显示名，磁盘文件名对不上。
+static bool lnk_display_name(const wchar_t *lnk_path, wchar_t *out, size_t outLen)
+{
+	out[0] = 0;
+	IShellItem *item = nullptr;
+	if(FAILED(::SHCreateItemFromParsingName(lnk_path, nullptr, IID_IShellItem, reinterpret_cast<void **>(&item))) || !item)
+		return false;
+
+	bool ok = false;
+	LPWSTR name = nullptr;
+	if(SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY, &name)) && name)
+	{
+		::wcsncpy_s(out, outLen, name, outLen - 1);
+		ok = out[0] != 0;
+		::CoTaskMemFree(name);
+	}
+	item->Release();
+	return ok;
+}
+
+// 未运行的固定项按钮上拿不到窗口，UIA 也**只给名字**（AutomationId 为空、没有 AUMID），
+// 所以只能拿按钮名去 User Pinned\TaskBar 里比对固定项的 .lnk。
+// 三级匹配：lnk 文件名 == 按钮名 → 去掉尾部 " (数字)" 再比 → lnk 的显示名 / target 主名 == 按钮名。
+// 命中后还要过 is_pinned_lnk_active（目录里残留的幽灵项不算固定项）。
+static bool find_pinned_lnk_by_name(const wchar_t *button_name, wchar_t *lnkOut, size_t lnkLen, wchar_t *exeOut, size_t exeLen)
+{
+	if(!button_name || !button_name[0])
+		return false;
+
+	// 按钮名形如 "任务管理器 - 1 个运行窗口"；取 " - " 之前的部分
+	wchar_t key[256]{};
+	const wchar_t *sep = ::wcsstr(button_name, L" - ");
+	size_t n = sep ? static_cast<size_t>(sep - button_name) : ::wcslen(button_name);
+	if(n == 0 || n >= 256)
+		return false;
+	::wcsncpy_s(key, 256, button_name, n);
+	normalize_for_match(key);
+
+	// 再去掉尾部的 " (数字)"（同一应用有多个固定项时任务栏会加序号，如 "Microsoft Edge (2)"）
+	wchar_t stripped[256]{};
+	::wcsncpy_s(stripped, 256, key, 256);
+	if(wchar_t *p = ::wcsrchr(stripped, L'('))
+	{
+		if(p > stripped && *(p - 1) == L' ')
+		{
+			wchar_t *q = p + 1;
+			bool digits = *q != 0;
+			for(; *q && *q != L')'; ++q)
+			{
+				if(*q < L'0' || *q > L'9')
+				{
+					digits = false;
+					break;
+				}
+			}
+			if(digits && *q == L')' && *(q + 1) == 0)
+				*(p - 1) = 0;
+		}
+	}
+
+	wchar_t dir[MAX_PATH]{};
+	if(!taskbar_pinned_dir(dir, MAX_PATH))
+		return false;
+
+	wchar_t pattern[MAX_PATH]{};
+	::swprintf_s(pattern, MAX_PATH, L"%s\\*.lnk", dir);
+	WIN32_FIND_DATAW fd{};
+	HANDLE h = ::FindFirstFileW(pattern, &fd);
+	if(h == INVALID_HANDLE_VALUE)
+		return false;
+
+	bool found = false;
+	do
+	{
+		if(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+			continue;
+
+		wchar_t full[MAX_PATH]{};
+		::swprintf_s(full, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
+
+		// ① lnk 文件名（去扩展名）
+		wchar_t stem[MAX_PATH]{};
+		::wcsncpy_s(stem, MAX_PATH, fd.cFileName, MAX_PATH);
+		if(wchar_t *dot = ::wcsrchr(stem, L'.'))
+			*dot = 0;
+		normalize_for_match(stem);
+
+		bool matched = ::_wcsicmp(stem, key) == 0;
+		if(!matched && stripped[0])
+			matched = ::_wcsicmp(stem, stripped) == 0;
+
+		// ② lnk 的本地化显示名（「文件资源管理器」↔ File Explorer (2).lnk）
+		if(!matched)
+		{
+			wchar_t disp[MAX_PATH]{};
+			if(lnk_display_name(full, disp, MAX_PATH))
+			{
+				normalize_for_match(disp);
+				matched = ::_wcsicmp(disp, key) == 0 || (stripped[0] && ::_wcsicmp(disp, stripped) == 0);
+			}
+		}
+
+		// ③ lnk 的 target 主名（没扩展名）
+		if(!matched)
+		{
+			wchar_t target[MAX_PATH]{};
+			if(lnk_target(full, target, MAX_PATH))
+			{
+				const wchar_t *file = ::wcsrchr(target, L'\\');
+				file = file ? file + 1 : target;
+				wchar_t base[MAX_PATH]{};
+				::wcsncpy_s(base, MAX_PATH, file, MAX_PATH);
+				if(wchar_t *dot = ::wcsrchr(base, L'.'))
+					*dot = 0;
+				matched = ::_wcsicmp(base, key) == 0 || (stripped[0] && ::_wcsicmp(base, stripped) == 0);
+			}
+		}
+
+		if(matched)
+		{
+			// 已被取消固定、只剩文件的幽灵项不算固定项
+			if(!is_pinned_lnk_active(full))
+				continue;
+
+			::wcsncpy_s(lnkOut, lnkLen, full, lnkLen - 1);
+			if(exeOut && exeLen && !lnk_target(full, exeOut, exeLen))
+				exeOut[0] = 0;
 			found = true;
 			break;
 		}
@@ -683,8 +1035,22 @@ static bool is_pinned_to_taskbar(const wchar_t *exe_path)
 	return find_pinned_lnk(exe_path, lnk, MAX_PATH);
 }
 
-// pin 完成后修正刚生成的快捷方式：补 AUMID（让它跟运行窗口合并）和图标（避免空白图标）
-static void fix_pinned_shortcut(const wchar_t *lnk_path, const wchar_t *exe_path, const wchar_t *aumid)
+static void set_lnk_prop(IPropertyStore *ps, REFPROPERTYKEY key, const wchar_t *value)
+{
+	if(!value || !value[0])
+		return;
+	PROPVARIANT pv{};
+	pv.vt = VT_LPWSTR;
+	pv.pwszVal = const_cast<LPWSTR>(value);
+	ps->SetValue(key, pv);
+}
+
+// pin 完成后修正刚生成的快捷方式：
+// ① 补上**整组** AppUserModel 属性（ID + RelaunchCommand + RelaunchDisplayNameResource + IconResource）——
+//    只补 AUMID 不够：任务栏算 AppID 还看 RelaunchCommand，缺了它固定项会跟运行窗口分成两个图标
+//    （实测 Blender：lnk 只有 ID、target 是 blender.exe，而窗口 relaunch 是 blender-launcher.exe）。
+// ② 补图标位置，避免空白图标。
+static void fix_pinned_shortcut(const wchar_t *lnk_path, const wchar_t *exe_path, const window_appmodel &am)
 {
 	IShellLinkW *link = nullptr;
 	if(FAILED(::CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW, reinterpret_cast<void **>(&link))) || !link)
@@ -695,18 +1061,15 @@ static void fix_pinned_shortcut(const wchar_t *lnk_path, const wchar_t *exe_path
 		if(SUCCEEDED(pf->Load(lnk_path, STGM_READWRITE)))
 		{
 			link->SetIconLocation(exe_path, 0);
-			if(aumid && aumid[0])
+			IPropertyStore *ps = nullptr;
+			if(SUCCEEDED(link->QueryInterface(IID_IPropertyStore, reinterpret_cast<void **>(&ps))) && ps)
 			{
-				IPropertyStore *ps = nullptr;
-				if(SUCCEEDED(link->QueryInterface(IID_IPropertyStore, reinterpret_cast<void **>(&ps))) && ps)
-				{
-					PROPVARIANT pv{};
-					pv.vt = VT_LPWSTR;
-					pv.pwszVal = const_cast<LPWSTR>(aumid);
-					if(SUCCEEDED(ps->SetValue(PKEY_AppUserModel_ID, pv)))
-						ps->Commit();
-					ps->Release();
-				}
+				set_lnk_prop(ps, PKEY_AppUserModel_ID, am.aumid);
+				set_lnk_prop(ps, PKEY_AppUserModel_RelaunchCommand, am.relaunch_command);
+				set_lnk_prop(ps, PKEY_AppUserModel_RelaunchDisplayNameResource, am.relaunch_display_name);
+				set_lnk_prop(ps, PKEY_AppUserModel_RelaunchIconResource, am.relaunch_icon);
+				ps->Commit();
+				ps->Release();
 			}
 			pf->Save(lnk_path, TRUE);
 		}
@@ -742,6 +1105,9 @@ static bool invoke_shell_verb(const wchar_t *path, const wchar_t *verb_name)
 			HMENU menu = ::CreatePopupMenu();
 			if(menu && SUCCEEDED(cm->QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL)))
 			{
+				// 找不到目标动词时，把枚举到的动词名记进日志：不同对象上挂的动词集合不一样
+				// （「从任务栏取消固定」只在固定项 .lnk 上有），下次失败可直接看清单定位。
+				wchar_t seen[512]{};
 				int count = ::GetMenuItemCount(menu);
 				for(int i = 0; i < count; ++i)
 				{
@@ -752,6 +1118,15 @@ static bool invoke_shell_verb(const wchar_t *path, const wchar_t *verb_name)
 					wchar_t verb[128]{};
 					if(SUCCEEDED(cm->GetCommandString(id - 1, GCS_VERBW, nullptr, reinterpret_cast<char *>(verb), 128)))
 					{
+						if(verb[0])
+						{
+							size_t used = ::wcslen(seen);
+							if(used > 0 && used < 500)
+								seen[used++] = L',';
+							for(const wchar_t *p = verb; *p && used < 505; ++p)
+								seen[used++] = *p;
+							seen[used] = 0;
+						}
 						if(::_wcsicmp(verb, verb_name) == 0)
 						{
 							CMINVOKECOMMANDINFOEX ci{};
@@ -765,6 +1140,10 @@ static bool invoke_shell_verb(const wchar_t *path, const wchar_t *verb_name)
 						}
 					}
 				}
+				if(!ok && !seen[0])
+					_log.info(L"[BTN] verb '%s' not found on '%s' (no verbs)", verb_name, path);
+				else if(!ok)
+					_log.info(L"[BTN] verb '%s' not found on '%s' (verbs: %s)", verb_name, path, seen);
 			}
 			if(menu)
 				::DestroyMenu(menu);
@@ -776,20 +1155,86 @@ static bool invoke_shell_verb(const wchar_t *path, const wchar_t *verb_name)
 	return ok;
 }
 
-// 后台线程里跑：QueryContextMenu 会加载一堆 shell 扩展，别拖住 explorer 的 UI 线程
-static void set_taskbar_pin_async(string path, HWND hWnd, bool pin)
+// 微软官方的「从任务栏 / 开始菜单取消固定」API（CLSID_StartMenuPin，实现于 shell32.dll）。
+// 它**只有 RemoveFromList**：官方没有提供「固定到任务栏」的 API（防止程序擅自改任务栏），
+// 所以「固定」只能走 shell 动词，「取消固定」在动词不可用时用这条兜底。
+// 实测用例：File Explorer (2).lnk 上压根没有 taskbarunpin 动词
+// （枚举结果只有 open/opencontaining/OpenNewWindow/cut/copy/link/delete/properties），
+// 但它在 Taskband\Favorites 里确实固定着，只能靠这条 API 取消。
+static bool start_menu_remove_from_list(const wchar_t *path)
 {
-	std::thread([path, hWnd, pin]()
+	if(!path || !path[0])
+		return false;
+
+	IStartMenuPinnedList *pinned = nullptr;
+	if(FAILED(::CoCreateInstance(CLSID_StartMenuPin, nullptr, CLSCTX_INPROC_SERVER, IID_IStartMenuPinnedList, reinterpret_cast<void **>(&pinned))) || !pinned)
+	{
+		_log.info(L"[BTN] StartMenuPin: CoCreateInstance failed");
+		return false;
+	}
+
+	IShellItem *item = nullptr;
+	HRESULT hr = ::SHCreateItemFromParsingName(path, nullptr, IID_IShellItem, reinterpret_cast<void **>(&item));
+	if(FAILED(hr) || !item)
+	{
+		_log.info(L"[BTN] StartMenuPin: SHCreateItemFromParsingName('%s') hr=0x%08X", path, (unsigned)hr);
+		pinned->Release();
+		return false;
+	}
+
+	hr = pinned->RemoveFromList(item);
+	_log.info(L"[BTN] StartMenuPin::RemoveFromList('%s') hr=0x%08X", path, (unsigned)hr);
+	item->Release();
+	pinned->Release();
+	return SUCCEEDED(hr);
+}
+
+// 后台线程里跑：QueryContextMenu 会加载一堆 shell 扩展，别拖住 explorer 的 UI 线程
+// lnk 为「该应用的固定项快捷方式」路径（可能为空）。取消固定的动词只挂在这种 .lnk 上。
+static void set_taskbar_pin_async(string path, string lnk, HWND hWnd, bool pin)
+{
+	std::thread([path, lnk, hWnd, pin]()
 	{
 		::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-		// 固定前先记住运行窗口的 AUMID，固定后写进快捷方式，否则固定项不会跟运行窗口合并
-		wchar_t aumid[256]{};
+		// 固定前先把运行窗口的整组 AppUserModel 属性记下来，固定后写进快捷方式 ——
+		// 只写 AUMID 不够，任务栏算 AppID 还看 RelaunchCommand，缺了就会分成两个图标
+		window_appmodel am;
 		if(pin)
-			get_window_aumid(hWnd, aumid, 256);
+		{
+			get_window_appmodel(hWnd, am);
 
-		bool ok = invoke_shell_verb(path.c_str(), pin ? L"TaskbarPin" : L"TaskbarUnpin");
-		_log.info(L"[BTN] %s '%s' -> %s", pin ? L"TaskbarPin" : L"TaskbarUnpin", path.c_str(), ok ? L"ok" : L"failed");
+			// 「文件资源管理器」例外：explorer 的窗口一个 AppUserModel 属性都不带，
+			// 但固定项必须写上这组值才能与运行窗口合并（实测写入后重启 explorer，
+			// 固定项与文件夹窗口合并成一个按钮）。这些值是 Windows 自己用的 ——
+			// AppsFolder 里 Microsoft.Windows.Explorer 的显示名就是「文件资源管理器」。
+			const wchar_t *file = ::wcsrchr(path.c_str(), L'\\');
+			file = file ? file + 1 : path.c_str();
+			if(!am.aumid[0] && ::_wcsicmp(file, L"explorer.exe") == 0)
+			{
+				::wcsncpy_s(am.aumid, 256, L"Microsoft.Windows.Explorer", 255);
+				if(!am.relaunch_command[0])
+					::wcsncpy_s(am.relaunch_command, 1024, L"\"C:\\Windows\\explorer.exe\"", 1023);
+				if(!am.relaunch_display_name[0])
+					::wcsncpy_s(am.relaunch_display_name, 512, L"\u6587\u4EF6\u8D44\u6E90\u7BA1\u7406\u5668", 511);
+			}
+		}
+
+		// 「从任务栏取消固定」的动词实测只挂在固定项的 .lnk 上
+		// （msedge.exe / DeepSeek Harness.exe / notepad.exe / 普通 lnk 上都没有），
+		// 对 exe 调用自然枚举不到 → 这是取消固定时灵时不灵的根因。
+		// 所以先从 .lnk 试，失败再回退到原来的 exe 路径。
+		bool ok = false;
+		if(!pin && !lnk.empty())
+			ok = invoke_shell_verb(lnk.c_str(), L"taskbarunpin");
+		if(!ok)
+			ok = invoke_shell_verb(path.c_str(), pin ? L"TaskbarPin" : L"TaskbarUnpin");
+		// 有些固定项的 .lnk 上压根没有 taskbarunpin 动词（实测「文件资源管理器」），
+		// 这时用官方 API 兜底（它只有取消固定，没有固定）。
+		if(!ok && !pin)
+			ok = start_menu_remove_from_list(lnk.empty() ? path.c_str() : lnk.c_str());
+		_log.info(L"[BTN] %s exe='%s' lnk='%s' -> %s",
+			pin ? L"TaskbarPin" : L"TaskbarUnpin", path.c_str(), lnk.c_str(), ok ? L"ok" : L"failed");
 
 		// 固定成功后补写快捷方式：AUMID + 图标位置
 		if(pin && ok)
@@ -800,8 +1245,9 @@ static void set_taskbar_pin_async(string path, HWND hWnd, bool pin)
 				wchar_t lnk[MAX_PATH]{};
 				if(find_pinned_lnk(path.c_str(), lnk, MAX_PATH))
 				{
-					fix_pinned_shortcut(lnk, path.c_str(), aumid);
-					_log.info(L"[BTN] patched lnk aumid='%s'", aumid);
+					fix_pinned_shortcut(lnk, path.c_str(), am);
+					_log.info(L"[BTN] patched lnk aumid='%s' relaunch='%s' name='%s'",
+						am.aumid, am.relaunch_command, am.relaunch_display_name);
 					break;
 				}
 			}
@@ -852,9 +1298,34 @@ static void close_app_window_async(HWND hWnd)
 	}).detach();
 }
 
+// 把匹配到的窗口收敛成「真正要关闭的顶层窗口」：按 GA_ROOT 去重 ——
+// UWP 会同时出现 CoreWindow 和它的宿主 ApplicationFrameWindow，其实是同一个窗口。
+static void distinct_top_windows(const std::vector<HWND> &in, std::vector<HWND> &out)
+{
+	out.clear();
+	for(HWND w : in)
+	{
+		HWND root = ::GetAncestor(w, GA_ROOT);
+		if(!root)
+			root = w;
+		bool dup = false;
+		for(HWND t : out)
+		{
+			if(t == root)
+			{
+				dup = true;
+				break;
+			}
+		}
+		if(!dup)
+			out.push_back(root);
+	}
+}
+
 static void show_taskbar_button_menu(HWND hWnd, const Point &pt, taskbar_button_info &info)
 {
-	info.window = find_app_window(info.title);
+	find_app_windows(info.title, info.windows);
+	info.window = info.windows.empty() ? nullptr : info.windows.front();
 
 	HMENU menu = ::CreatePopupMenu();
 	if(!menu)
@@ -869,12 +1340,13 @@ static void show_taskbar_button_menu(HWND hWnd, const Point &pt, taskbar_button_
 	const wchar_t *text_pin = L"\u56FA\u5B9A\u5230\u4EFB\u52A1\u680F";                       // 固定到任务栏
 	const wchar_t *text_unpin = L"\u4ECE\u4EFB\u52A1\u680F\u53D6\u6D88\u56FA\u5B9A";         // 从任务栏取消固定
 	const wchar_t *text_close = L"\u5173\u95ED\u7A97\u53E3";                                 // 关闭窗口
+	const wchar_t *text_close_all = L"\u5173\u95ED\u6240\u6709\u7A97\u53E3";                 // 关闭所有窗口
 
 	auto title = info.title.empty() ? string(L"Application") : info.title;
 	::AppendMenuW(menu, MF_STRING, 0, title.c_str());
 	::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
-	// 固定 / 取消固定：按当前是否已固定决定显示哪个，并记下 exe 路径给动作分支用
+	// 固定 / 取消固定：按当前是否已固定决定显示哪个，并记下 exe / 固定项 .lnk 给动作分支用
 	wchar_t exe_path[MAX_PATH]{};
 	bool has_exe = false;
 	if(info.window)
@@ -892,19 +1364,37 @@ static void show_taskbar_button_menu(HWND hWnd, const Point &pt, taskbar_button_
 			}
 		}
 	}
-	if(has_exe)
-	{
-		if(is_pinned_to_taskbar(exe_path))
-			::AppendMenuW(menu, MF_STRING, id_unpin, text_unpin);
-		else
-			::AppendMenuW(menu, MF_STRING, id_pin, text_pin);
-	}
-	::AppendMenuW(menu, MF_STRING, id_close, text_close);
 
-	_log.info(L"[BTN] pid=%d window=0x%x class='%s' title='%s'",
-		info.pid, (unsigned)(ULONG_PTR)info.window,
+	// 没运行（纯固定项按钮）时上面拿不到 exe：改用按钮名去固定项目录里找对应的 .lnk，
+	// 顺带取它的 target 当 exe（「文件资源管理器」这类 lnk 没有 target，只拿到 .lnk）
+	wchar_t pinned_lnk[MAX_PATH]{};
+	bool has_pinned_lnk = false;
+	if(!has_exe)
+	{
+		has_pinned_lnk = find_pinned_lnk_by_name(info.title.c_str(), pinned_lnk, MAX_PATH, exe_path, MAX_PATH);
+		if(has_pinned_lnk && exe_path[0])
+			has_exe = true;
+	}
+	// 运行中的固定项：由 exe 反查它的固定项 .lnk（取消固定的动词挂在 .lnk 上）
+	if(!has_pinned_lnk && has_exe)
+		has_pinned_lnk = find_pinned_lnk(exe_path, pinned_lnk, MAX_PATH);
+
+	if(has_pinned_lnk)
+		::AppendMenuW(menu, MF_STRING, id_unpin, text_unpin);
+	else if(has_exe)
+		::AppendMenuW(menu, MF_STRING, id_pin, text_pin);
+
+	// 「关闭窗口」只在真的有运行窗口时才给：没有窗口时点它没有任何作用。
+	// 应用有多个窗口（合并按钮）时改成「关闭所有窗口」，一次全关。
+	std::vector<HWND> close_targets;
+	distinct_top_windows(info.windows, close_targets);
+	if(!close_targets.empty())
+		::AppendMenuW(menu, MF_STRING, id_close, close_targets.size() > 1 ? text_close_all : text_close);
+
+	_log.info(L"[BTN] pid=%d window=0x%x windows=%d class='%s' title='%s' exe='%s' lnk='%s'",
+		info.pid, (unsigned)(ULONG_PTR)info.window, static_cast<int>(close_targets.size()),
 		info.window ? Window::class_name(info.window).c_str() : L"<null>",
-		info.title.c_str());
+		info.title.c_str(), exe_path, pinned_lnk);
 
 	// 菜单必须先拿到前台/焦点：否则键盘导航无效，鼠标第一次点击只当"激活"，
 	// 且任何进程抢焦点都会把菜单关掉（返回 0）。
@@ -913,30 +1403,31 @@ static void show_taskbar_button_menu(HWND hWnd, const Point &pt, taskbar_button_
 	::SetForegroundWindow(hWnd);
 
 	is_in_taskbar = true;
+	in_taskbar_button_menu = true;
 	auto cmd = TrackPopupMenuExProc(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, hWnd, nullptr);
+	in_taskbar_button_menu = false;
 	is_in_taskbar = false;
 
 	_log.info(L"[BTN] command=%d", static_cast<int>(cmd));
 
-	if(cmd == id_close && info.window)
+	if(cmd == id_close && !close_targets.empty())
 	{
 		// UWP 应用（设置 / 商店等）里层的 Windows.UI.Core.CoreWindow 不响应 SC_CLOSE，
-		// 必须把关闭消息发给顶层宿主（ApplicationFrameWindow）。
-		auto target = ::GetAncestor(info.window, GA_ROOT);
-		if(!target)
-			target = info.window;
-		_log.info(L"[BTN] close window=0x%x target=0x%x", (unsigned)(ULONG_PTR)info.window, (unsigned)(ULONG_PTR)target);
-		close_app_window_async(target);
+		// 必须把关闭消息发给顶层宿主（ApplicationFrameWindow）—— 上面已按 GA_ROOT 收敛过。
+		// 多窗口（合并按钮）时逐个发关闭请求，应用自己仍可弹保存/取消框。
+		_log.info(L"[BTN] close %d window(s)", static_cast<int>(close_targets.size()));
+		for(HWND t : close_targets)
+			close_app_window_async(t);
 	}
 	else if(cmd == id_pin && has_exe)
 	{
 		_log.info(L"[BTN] pin '%s'", exe_path);
-		set_taskbar_pin_async(exe_path, info.window, true);
+		set_taskbar_pin_async(exe_path, string(), info.window, true);
 	}
-	else if(cmd == id_unpin && has_exe)
+	else if(cmd == id_unpin && has_pinned_lnk)
 	{
-		_log.info(L"[BTN] unpin '%s'", exe_path);
-		set_taskbar_pin_async(exe_path, info.window, false);
+		_log.info(L"[BTN] unpin exe='%s' lnk='%s'", exe_path, pinned_lnk);
+		set_taskbar_pin_async(has_exe ? string(exe_path) : string(), string(pinned_lnk), info.window, false);
 	}
 
 	::DestroyMenu(menu);
@@ -1138,6 +1629,10 @@ STDAPI WINAPI DllGetClassObjectHook(REFCLSID rclsid, _In_ REFIID riid, LPVOID *p
 
 #define TPM_SYSMENU	0x0200L
 bool is_in_taskbar;
+// 任务栏「应用按钮」自建菜单期间为 true（见 show_taskbar_button_menu）。
+// ContextMenu 用它决定这次不加载 .nss 配置项 —— 对单个应用按钮来说配置项没有意义
+// （实际会冒出来的就是「转到」）。任务栏空白处 / 桌面 / 文件菜单不走这条路径，不受影响。
+bool in_taskbar_button_menu;
 
 BOOL WINAPI TrackPopupMenuProc(HMENU hMenu, uint32_t uFlags, int x, int y, int nReserved, HWND hWnd, const RECT *prcRect);
 BOOL WINAPI TrackPopupMenuExProc(HMENU hMenu, uint32_t uFlags, int x, int y, HWND hWnd, LPTPMPARAMS lptpm);

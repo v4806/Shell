@@ -1399,6 +1399,54 @@ static void distinct_top_windows(const std::vector<HWND> &in, std::vector<HWND> 
 	}
 }
 
+// 把窗口切到前台。为什么写这么啰嗦：
+//   explorer 是**中完整性**进程，而像「任务管理器」这种以管理员运行的窗口是**高完整性**：
+//   - SetForegroundWindow 常被 Windows 的「前台锁」拒绝（调用方不是当前前台时）；
+//   - 常规兜底 AttachThreadInput 要访问目标线程的输入队列，**跨完整性会被 UIPI 挡掉**。
+//   所以按代价递增依次尝试；最后一条 SwitchToThisWindow 是任务栏点击内部用的老 API。
+//   注意最小化窗口只要 ShowWindow（不碰输入队列），这解释了「最小化时能唤起、从后台切不过来」。
+extern "C" __declspec(dllimport) void WINAPI SwitchToThisWindow(HWND hwnd, BOOL fUnknown);
+
+static bool activate_top_window(HWND hWnd)
+{
+	if(!hWnd || !::IsWindow(hWnd))
+		return false;
+
+	if(::IsIconic(hWnd))
+		::ShowWindow(hWnd, SW_RESTORE);
+	else
+		::ShowWindow(hWnd, SW_SHOW);
+
+	if(::GetForegroundWindow() == hWnd)
+		return true;
+	if(::SetForegroundWindow(hWnd))
+		return true;
+
+	// 兜底 1：接上当前前台线程的输入队列（同完整性时有效；目标是提权进程时会被 UIPI 拒绝）
+	if(auto fg = ::GetForegroundWindow())
+	{
+		const auto tid_fg = ::GetWindowThreadProcessId(fg, nullptr);
+		const auto tid_me = ::GetCurrentThreadId();
+		if(tid_fg && tid_fg != tid_me && ::AttachThreadInput(tid_me, tid_fg, TRUE))
+		{
+			const bool ok = ::SetForegroundWindow(hWnd) != FALSE;
+			::AttachThreadInput(tid_me, tid_fg, FALSE);
+			if(ok)
+				return true;
+		}
+	}
+
+	// 兜底 2：模拟一次 ALT 键 —— 前台锁在收到键盘输入后会放开，对提权窗口同样有效
+	::keybd_event(VK_MENU, 0, 0, 0);
+	::keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+	if(::SetForegroundWindow(hWnd))
+		return true;
+
+	// 兜底 3：任务栏点击内部用的老 API
+	::SwitchToThisWindow(hWnd, TRUE);
+	return ::GetForegroundWindow() == hWnd;
+}
+
 static void show_taskbar_button_menu(HWND hWnd, const Point &pt, taskbar_button_info &info)
 {
 	find_app_windows(info.title, info.windows);
@@ -1495,27 +1543,13 @@ static void show_taskbar_button_menu(HWND hWnd, const Point &pt, taskbar_button_
 
 	if(cmd == id_activate)
 	{
-		_log.info(L"[BTN] activate window=0x%x exe='%s'", (unsigned)(ULONG_PTR)info.window, exe_path);
 		if(info.window)
 		{
-			if(::IsIconic(info.window))
-				::ShowWindow(info.window, SW_RESTORE);
-			if(!::SetForegroundWindow(info.window))
-			{
-				// 前台锁（foreground lock）会拒绝 SetForegroundWindow：
-				// 临时把输入队列接到当前前台线程，再试一次。
-				if(auto fg = ::GetForegroundWindow())
-				{
-					const auto tid_fg = ::GetWindowThreadProcessId(fg, nullptr);
-					const auto tid_me = ::GetCurrentThreadId();
-					if(tid_fg && tid_fg != tid_me)
-					{
-						::AttachThreadInput(tid_me, tid_fg, TRUE);
-						::SetForegroundWindow(info.window);
-						::AttachThreadInput(tid_me, tid_fg, FALSE);
-					}
-				}
-			}
+			const bool ok = activate_top_window(info.window);
+			// 记下成功与否与实际前台窗口：以后「点了没反应」时一眼能看出卡在哪一步。
+			_log.info(L"[BTN] activate window=0x%x ok=%d fg=0x%x exe='%s'",
+					  (unsigned)(ULONG_PTR)info.window, ok ? 1 : 0,
+					  (unsigned)(ULONG_PTR)::GetForegroundWindow(), exe_path);
 		}
 		else
 		{

@@ -1,4 +1,4 @@
-﻿#include <pch.h>
+#include <pch.h>
 #include "Resource.h"
 #include "Expression\Constants.h"
 #include "Expression\Variable.h"
@@ -8,6 +8,9 @@
 #include <propkey.h>
 
 #include <regex>
+
+// 定义在 Main.cpp：杀掉任务栏「应用按钮」菜单当前对应窗口的进程树（command.kill_process_tree）。
+extern bool kill_taskbar_button_process_tree();
 
 //#include <filesystem>
 
@@ -1461,7 +1464,15 @@ namespace Nilesoft
 								_result = sel->Window.desktop;
 								break;
 							case IDENT_IS_TASKBAR:
-								_result = sel->Window.parent == WINDOW_TASKBAR;
+								// 按钮菜单虽然也挂在任务栏上，但它有自己的上下文类型
+								// （FSO_TASKBAR_BUTTON），这里返回 false，
+								// 好让 type='taskbar' / window.is_taskbar 写的项（例如「转到」）
+								// 不会跟着跑进按钮菜单。
+								_result = (sel->Window.parent == WINDOW_TASKBAR) && !(sel->Types[FSO_TASKBAR_BUTTON] > 0);
+								break;
+							case IDENT_IS_TASKBAR_BUTTON:
+								// 只对任务栏「应用按钮」的自建菜单为真（见 ContextMenu.cpp 的 WINDOW_TASKBAR 分支）
+								_result = sel->Types[FSO_TASKBAR_BUTTON] > 0;
 								break;
 							case IDENT_IS_EXPLORER:
 								_result = sel->Window.explorer;
@@ -1717,6 +1728,10 @@ namespace Nilesoft
 							break;
 						case IDENT_COMMAND_RESTART_EXPLORER:
 							_result = Windows::Explorer::Restart();
+							break;
+						case IDENT_COMMAND_KILL_PROCESS_TREE:
+							// 结束该任务栏按钮对应窗口的进程树（按钮菜单由 command.kill_process_tree 提供该项）
+							_result = kill_taskbar_button_process_tree();
 							break;
 						case IDENT_COMMAND_TOGGLEHIDDEN:
 							Explorer::ToggleHiddenFiles();

@@ -5,7 +5,7 @@
 
 using namespace Nilesoft::Diagnostics;
 
-// 定义在 Main.cpp：任务栏「应用按钮」自建菜单期间为 true（全局命名空间）
+// Defined in Main.cpp: true while the self-built taskbar "app button" menu is open (global namespace)
 extern bool in_taskbar_button_menu;
 #include <mutex>
 
@@ -1111,9 +1111,9 @@ namespace Nilesoft
 			
 			std::vector<MenuItemInfo *> bottom_items;
 
-			// 配置里新增的 menu(...)/item(...) 就是这一步加进来的。按钮菜单同样吃这一套：
-			// 它已是独立类型（FSO_TASKBAR_BUTTON），普通 taskbar 项不会命中它，
-			// 所以这里不再需要按 in_taskbar_button_menu 屏蔽。
+			// New menu(...)/item(...) entries from the config are added here. The button menu uses the same path:
+			// it has its own context type (FSO_TASKBAR_BUTTON), so plain taskbar items do not match it and no
+			// in_taskbar_button_menu guard is needed here any more.
 			if(_settings.new_items.enabled)
 			{
 				if(!(owner && owner->is_disabled()))
@@ -4399,15 +4399,15 @@ namespace Nilesoft
 				switch(Selected.Window.id)
 				{
 					case WINDOW_TASKBAR:
-						// 任务栏「应用按钮」的自建菜单（见 Main.cpp 的 in_taskbar_button_menu）走独立类型位：
-						// 它虽然是任务栏的上下文，但类型标成 FSO_TASKBAR_BUTTON 而不是 FSO_TASKBAR，
-						// 于是「转到」、imports/taskbar.nss 这些已按 type='taskbar'/window.is_taskbar 写好的项
-						// 不会自动涌进按钮菜单；配置里要用 where=window.is_taskbar_button 才能命中。
+						// The self-built taskbar "app button" menu (see in_taskbar_button_menu in Main.cpp) uses its own type bit:
+						// it is a taskbar context, but flagged as FSO_TASKBAR_BUTTON rather than FSO_TASKBAR, so items
+						// written for type='taskbar'/window.is_taskbar ("Go to", imports/taskbar.nss) do not flood the
+						// button menu; use where=window.is_taskbar_button to target it.
 						if(in_taskbar_button_menu)
 							Selected.Types[FSO_TASKBAR_BUTTON] = TRUE;
 						else
 							Selected.Types[FSO_TASKBAR] = TRUE;
-						// front 保持 FSO_TASKBAR：按钮菜单此前也是这个值，避免影响依赖它的显示逻辑。
+						// 'front' stays FSO_TASKBAR: the button menu had this value before, keeping display logic intact.
 						Selected.front = FSO_TASKBAR;
 						Selected.Directory = Path::GetKnownFolder(FOLDERID_Desktop).move();
 						break;
@@ -4484,8 +4484,8 @@ namespace Nilesoft
 				if(0 == ::GetPropW(hwnd.owner, UxSubclass))
 					build_system_menuitems(_hMenu_original, __system_menu_tree, true);
 
-				// modify(...) 这类「修改已有项」的规则同样允许作用到按钮菜单（它已是独立类型，
-				// 通用 taskbar 规则不会误伤），因此不再按 in_taskbar_button_menu 屏蔽。
+				// modify(...) rules that alter existing items may also apply to the button menu (it has its own
+				// type, so generic taskbar rules cannot hit it), hence no in_taskbar_button_menu guard here.
 				if(_settings.modify_items.enabled)
 					build_main_system_menuitems(__system_menu_tree, true);
 

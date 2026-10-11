@@ -4,6 +4,9 @@
 #include "Include/stb_image_write.h"
 
 using namespace Nilesoft::Diagnostics;
+
+// 定义在 Main.cpp：任务栏「应用按钮」自建菜单期间为 true（全局命名空间）
+extern bool in_taskbar_button_menu;
 #include <mutex>
 
 extern Logger &_log;
@@ -1108,7 +1111,11 @@ namespace Nilesoft
 			
 			std::vector<MenuItemInfo *> bottom_items;
 
-			if(_settings.new_items.enabled)
+			// 任务栏「应用按钮」自建菜单不加载 .nss 配置项（标志见 Main.cpp 的 in_taskbar_button_menu）。
+			// 配置里新增的 menu(...)/item(...) 就是这一步加进来的 —— 例如「转到」（imports/goto.nss），
+			// 对单个应用按钮没有意义。注意这与下面 build_main_system_menuitems 那条是**两个不同入口**：
+			// 这里管「新增项」，那里管 modify(...) 这类「修改已有项」的规则。
+			if(_settings.new_items.enabled && !in_taskbar_button_menu)
 			{
 				if(!(owner && owner->is_disabled()))
 				{
@@ -4470,7 +4477,10 @@ namespace Nilesoft
 				if(0 == ::GetPropW(hwnd.owner, UxSubclass))
 					build_system_menuitems(_hMenu_original, __system_menu_tree, true);
 
-				if(_settings.modify_items.enabled)
+				// 任务栏「应用按钮」的自建菜单里不加载 .nss 配置项 —— 例如「转到」对单个应用按钮
+				// 没有意义（这些项由 _cache->statics 应用，就是这一步）。
+				// 任务栏空白处 / 桌面 / 文件菜单不走这条自建菜单路径，行为不变。
+				if(_settings.modify_items.enabled && !in_taskbar_button_menu)
 					build_main_system_menuitems(__system_menu_tree, true);
 
 				return true;

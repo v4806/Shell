@@ -3,6 +3,8 @@
 #include "Library/detours.h"
 #include "RegistryConfig.h"
 #include <UIAutomation.h>
+#include <propkey.h>      // PKEY_AppUserModel_ID（固定快捷方式时要用）
+#include <shlobj.h>       // CSIDL_APPDATA / IShellLink
 using namespace Nilesoft::Shell;
 using namespace Diagnostics;
 
@@ -586,6 +588,133 @@ static HWND find_app_window(string const &button_name)
 	return f.hwnd;
 }
 
+// ===== 任务栏固定 / 取消固定 =====
+// 任务栏靠 AppUserModelID 合并「固定项」与「运行中的窗口」：
+// 若 .lnk 的 AUMID 与运行窗口的不一致，固定后就会出现两个图标（QQ 就是这种）。
+// 图标同理，.lnk 的 IconLocation 为空时某些应用（Edge）会显示成空白图标。
+
+static bool taskbar_pinned_dir(wchar_t *out, size_t outLen)
+{
+	wchar_t appdata[MAX_PATH]{};
+	if(!::SHGetSpecialFolderPathW(nullptr, appdata, CSIDL_APPDATA, FALSE))
+		return false;
+	::swprintf_s(out, outLen, L"%s\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar", appdata);
+	return true;
+}
+
+// 读窗口的 AppUserModelID
+static bool get_window_aumid(HWND hWnd, wchar_t *out, size_t outLen)
+{
+	out[0] = 0;
+	if(!hWnd)
+		return false;
+	IPropertyStore *ps = nullptr;
+	if(FAILED(::SHGetPropertyStoreForWindow(hWnd, IID_IPropertyStore, reinterpret_cast<void **>(&ps))) || !ps)
+		return false;
+	PROPVARIANT pv{};
+	bool ok = false;
+	if(SUCCEEDED(ps->GetValue(PKEY_AppUserModel_ID, &pv)))
+	{
+		if(pv.vt == VT_LPWSTR && pv.pwszVal)
+		{
+			::wcsncpy_s(out, outLen, pv.pwszVal, outLen - 1);
+			ok = out[0] != 0;
+		}
+		::PropVariantClear(&pv);
+	}
+	ps->Release();
+	return ok;
+}
+
+// 该 .lnk 的目标是否就是这个 exe
+static bool lnk_targets(const wchar_t *lnk_path, const wchar_t *exe_path)
+{
+	IShellLinkW *link = nullptr;
+	if(FAILED(::CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW, reinterpret_cast<void **>(&link))) || !link)
+		return false;
+	bool ok = false;
+	IPersistFile *pf = nullptr;
+	if(SUCCEEDED(link->QueryInterface(IID_IPersistFile, reinterpret_cast<void **>(&pf))) && pf)
+	{
+		if(SUCCEEDED(pf->Load(lnk_path, STGM_READ)))
+		{
+			wchar_t target[MAX_PATH]{};
+			if(SUCCEEDED(link->GetPath(target, MAX_PATH, nullptr, SLGP_UNCPRIORITY)))
+				ok = ::_wcsicmp(target, exe_path) == 0;
+		}
+		pf->Release();
+	}
+	link->Release();
+	return ok;
+}
+
+// 在 User Pinned\TaskBar 里找该 exe 的固定项快捷方式
+static bool find_pinned_lnk(const wchar_t *exe_path, wchar_t *out, size_t outLen)
+{
+	wchar_t dir[MAX_PATH]{};
+	if(!taskbar_pinned_dir(dir, MAX_PATH))
+		return false;
+
+	wchar_t pattern[MAX_PATH]{};
+	::swprintf_s(pattern, MAX_PATH, L"%s\\*.lnk", dir);
+	WIN32_FIND_DATAW fd{};
+	HANDLE h = ::FindFirstFileW(pattern, &fd);
+	if(h == INVALID_HANDLE_VALUE)
+		return false;
+	bool found = false;
+	do
+	{
+		wchar_t full[MAX_PATH]{};
+		::swprintf_s(full, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
+		if(lnk_targets(full, exe_path))
+		{
+			::wcsncpy_s(out, outLen, full, outLen - 1);
+			found = true;
+			break;
+		}
+	} while(::FindNextFileW(h, &fd));
+	::FindClose(h);
+	return found;
+}
+
+static bool is_pinned_to_taskbar(const wchar_t *exe_path)
+{
+	wchar_t lnk[MAX_PATH]{};
+	return find_pinned_lnk(exe_path, lnk, MAX_PATH);
+}
+
+// pin 完成后修正刚生成的快捷方式：补 AUMID（让它跟运行窗口合并）和图标（避免空白图标）
+static void fix_pinned_shortcut(const wchar_t *lnk_path, const wchar_t *exe_path, const wchar_t *aumid)
+{
+	IShellLinkW *link = nullptr;
+	if(FAILED(::CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW, reinterpret_cast<void **>(&link))) || !link)
+		return;
+	IPersistFile *pf = nullptr;
+	if(SUCCEEDED(link->QueryInterface(IID_IPersistFile, reinterpret_cast<void **>(&pf))) && pf)
+	{
+		if(SUCCEEDED(pf->Load(lnk_path, STGM_READWRITE)))
+		{
+			link->SetIconLocation(exe_path, 0);
+			if(aumid && aumid[0])
+			{
+				IPropertyStore *ps = nullptr;
+				if(SUCCEEDED(link->QueryInterface(IID_IPropertyStore, reinterpret_cast<void **>(&ps))) && ps)
+				{
+					PROPVARIANT pv{};
+					pv.vt = VT_LPWSTR;
+					pv.pwszVal = const_cast<LPWSTR>(aumid);
+					if(SUCCEEDED(ps->SetValue(PKEY_AppUserModel_ID, pv)))
+						ps->Commit();
+					ps->Release();
+				}
+			}
+			pf->Save(lnk_path, TRUE);
+		}
+		pf->Release();
+	}
+	link->Release();
+}
+
 // 调用 shell 上下文菜单里的某个动词（按语言无关的规范名，如 "TaskbarPin"）。
 //
 // 为什么不能直接用 ShellExecuteEx(verb)：
@@ -648,13 +777,35 @@ static bool invoke_shell_verb(const wchar_t *path, const wchar_t *verb_name)
 }
 
 // 后台线程里跑：QueryContextMenu 会加载一堆 shell 扩展，别拖住 explorer 的 UI 线程
-static void pin_to_taskbar_async(string path)
+static void set_taskbar_pin_async(string path, HWND hWnd, bool pin)
 {
-	std::thread([path]()
+	std::thread([path, hWnd, pin]()
 	{
 		::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-		bool ok = invoke_shell_verb(path.c_str(), L"TaskbarPin");
-		_log.info(L"[BTN] TaskbarPin '%s' -> %s", path.c_str(), ok ? L"ok" : L"failed");
+
+		// 固定前先记住运行窗口的 AUMID，固定后写进快捷方式，否则固定项不会跟运行窗口合并
+		wchar_t aumid[256]{};
+		if(pin)
+			get_window_aumid(hWnd, aumid, 256);
+
+		bool ok = invoke_shell_verb(path.c_str(), pin ? L"TaskbarPin" : L"TaskbarUnpin");
+		_log.info(L"[BTN] %s '%s' -> %s", pin ? L"TaskbarPin" : L"TaskbarUnpin", path.c_str(), ok ? L"ok" : L"failed");
+
+		// 固定成功后补写快捷方式：AUMID + 图标位置
+		if(pin && ok)
+		{
+			for(int i = 0; i < 25; ++i)
+			{
+				::Sleep(200);
+				wchar_t lnk[MAX_PATH]{};
+				if(find_pinned_lnk(path.c_str(), lnk, MAX_PATH))
+				{
+					fix_pinned_shortcut(lnk, path.c_str(), aumid);
+					_log.info(L"[BTN] patched lnk aumid='%s'", aumid);
+					break;
+				}
+			}
+		}
 		::CoUninitialize();
 	}).detach();
 }
@@ -711,16 +862,43 @@ static void show_taskbar_button_menu(HWND hWnd, const Point &pt, taskbar_button_
 
 	const UINT id_pin = 0x1001;
 	const UINT id_close = 0x1002;
+	const UINT id_unpin = 0x1003;
 
 	// 源码文件无 BOM，MSVC 按 GBK(936) 解析源文件，中文字面量必须用 \u 转义，
 	// 否则会乱码："固定到任务栏" → "鏁哄畾鍒颁换鍔℃爮"
-	const wchar_t *text_pin = L"\u56FA\u5B9A\u5230\u4EFB\u52A1\u680F";   // 固定到任务栏
-	const wchar_t *text_close = L"\u5173\u95ED\u7A97\u53E3";             // 关闭窗口
+	const wchar_t *text_pin = L"\u56FA\u5B9A\u5230\u4EFB\u52A1\u680F";                       // 固定到任务栏
+	const wchar_t *text_unpin = L"\u4ECE\u4EFB\u52A1\u680F\u53D6\u6D88\u56FA\u5B9A";         // 从任务栏取消固定
+	const wchar_t *text_close = L"\u5173\u95ED\u7A97\u53E3";                                 // 关闭窗口
 
 	auto title = info.title.empty() ? string(L"Application") : info.title;
 	::AppendMenuW(menu, MF_STRING, 0, title.c_str());
 	::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-	::AppendMenuW(menu, MF_STRING, id_pin, text_pin);
+
+	// 固定 / 取消固定：按当前是否已固定决定显示哪个，并记下 exe 路径给动作分支用
+	wchar_t exe_path[MAX_PATH]{};
+	bool has_exe = false;
+	if(info.window)
+	{
+		DWORD pid = 0;
+		::GetWindowThreadProcessId(info.window, &pid);
+		if(pid)
+		{
+			if(HANDLE hp = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid))
+			{
+				DWORD size = MAX_PATH;
+				if(::QueryFullProcessImageNameW(hp, 0, exe_path, &size))
+					has_exe = true;
+				::CloseHandle(hp);
+			}
+		}
+	}
+	if(has_exe)
+	{
+		if(is_pinned_to_taskbar(exe_path))
+			::AppendMenuW(menu, MF_STRING, id_unpin, text_unpin);
+		else
+			::AppendMenuW(menu, MF_STRING, id_pin, text_pin);
+	}
 	::AppendMenuW(menu, MF_STRING, id_close, text_close);
 
 	_log.info(L"[BTN] pid=%d window=0x%x class='%s' title='%s'",
@@ -750,27 +928,15 @@ static void show_taskbar_button_menu(HWND hWnd, const Point &pt, taskbar_button_
 		_log.info(L"[BTN] close window=0x%x target=0x%x", (unsigned)(ULONG_PTR)info.window, (unsigned)(ULONG_PTR)target);
 		close_app_window_async(target);
 	}
-	else if(cmd == id_pin)
+	else if(cmd == id_pin && has_exe)
 	{
-		// 注意：不能用 info.pid —— UIA 对任务栏按钮返回的是 shell 进程的 pid，
-		// 必须从找到的应用窗口反查进程，才能拿到正确的 exe 路径。
-		DWORD pid = 0;
-		if(info.window)
-			::GetWindowThreadProcessId(info.window, &pid);
-		wchar_t path[MAX_PATH]{};
-		if(pid)
-		{
-			if(HANDLE hProcess = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid))
-			{
-				DWORD size = MAX_PATH;
-				if(!::QueryFullProcessImageNameW(hProcess, 0, path, &size))
-					path[0] = 0;
-				::CloseHandle(hProcess);
-			}
-		}
-		_log.info(L"[BTN] pin '%s'", path);
-		if(path[0])
-			pin_to_taskbar_async(path);
+		_log.info(L"[BTN] pin '%s'", exe_path);
+		set_taskbar_pin_async(exe_path, info.window, true);
+	}
+	else if(cmd == id_unpin && has_exe)
+	{
+		_log.info(L"[BTN] unpin '%s'", exe_path);
+		set_taskbar_pin_async(exe_path, info.window, false);
 	}
 
 	::DestroyMenu(menu);

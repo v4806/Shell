@@ -170,6 +170,7 @@ namespace Nilesoft
 		constexpr auto IDENT_IS_DESKTOP = 0xE40E965AU;
 		constexpr auto IDENT_IS_TASKBAR = 0xAA5D7188U;
 		constexpr auto IDENT_IS_TASKBAR_BUTTON = 0xCFAA4CE3U;
+		constexpr auto IDENT_TASKBAR_BUTTON_WINDOWS = 0x3D2E0A72U;
 		constexpr auto IDENT_IS_EXPLORER = 0x01C5A551U;
 		constexpr auto IDENT_IS_STARTED = 0x8873A357U;
 		constexpr auto IDENT_IS_NAV = 0x0523A9A5U;

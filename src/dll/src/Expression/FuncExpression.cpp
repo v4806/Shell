@@ -11,6 +11,8 @@
 
 // 定义在 Main.cpp：杀掉任务栏「应用按钮」菜单当前对应窗口的进程树（command.kill_process_tree）。
 extern bool kill_taskbar_button_process_tree();
+// 定义在 Main.cpp：按钮菜单当前匹配到的顶层窗口（window.taskbar_button_windows）。
+extern std::vector<HWND> taskbar_button_windows;
 
 //#include <filesystem>
 
@@ -1473,6 +1475,11 @@ namespace Nilesoft
 							case IDENT_IS_TASKBAR_BUTTON:
 								// 只对任务栏「应用按钮」的自建菜单为真（见 ContextMenu.cpp 的 WINDOW_TASKBAR 分支）
 								_result = sel->Types[FSO_TASKBAR_BUTTON] > 0;
+								break;
+							case IDENT_TASKBAR_BUTTON_WINDOWS:
+								// 按钮菜单当前匹配到的窗口数：0 表示这个按钮没有可操作的目标
+								// （窗口认不出来 / 应用已退出），配置项可以用它把死项藏掉。
+								_result = static_cast<int>(taskbar_button_windows.size());
 								break;
 							case IDENT_IS_EXPLORER:
 								_result = sel->Window.explorer;

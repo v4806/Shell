@@ -1758,6 +1758,7 @@ namespace Nilesoft
 						case IDENT_IS_DESKTOP:
 						case IDENT_IS_TASKBAR:
 						case IDENT_IS_TASKBAR_BUTTON:
+						case IDENT_TASKBAR_BUTTON_WINDOWS:
 						case IDENT_IS_EXPLORER:
 						case IDENT_IS_NAV:
 						case IDENT_IS_TREE:

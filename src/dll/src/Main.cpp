@@ -1605,34 +1605,55 @@ LRESULT __stdcall TaskListProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 	return ::CallWindowProcW(proc, hWnd, uMsg, wParam, lParam);
 }
 
-static bool tasklist_hook()
+// 给**一个**任务栏挂 hook：主任务栏（Shell_TrayWnd）与副屏任务栏（Shell_SecondaryTrayWnd）
+// 的窗口链是一样的 —— ReBarWindow32 → MSTaskSwWClass → MSTaskListWClass。
+static bool tasklist_hook_window(HWND tray)
 {
-	auto tray = ::FindWindowW(Windows::WC_Shell_TrayWnd, nullptr);
-	_log.info(L"[PROBE] step1 tray=0x%x", (unsigned)(ULONG_PTR)tray);
 	if(!tray)
 		return false;
 	auto rebar = ::FindWindowExW(tray, nullptr, Windows::WC_ReBarWindow32, nullptr);
-	_log.info(L"[PROBE] step2 rebar=0x%x", (unsigned)(ULONG_PTR)rebar);
 	if(!rebar)
 		return false;
 	auto sw = ::FindWindowExW(rebar, nullptr, Windows::WC_MSTaskSwWClass, nullptr);
-	_log.info(L"[PROBE] step3 sw=0x%x", (unsigned)(ULONG_PTR)sw);
 	if(!sw)
 		return false;
 	auto list = ::FindWindowExW(sw, nullptr, Windows::WC_MSTaskListWClass, nullptr);
-	_log.info(L"[PROBE] step4 list=0x%x", (unsigned)(ULONG_PTR)list);
 	if(!list)
 		return false;
 	if(::GetPropW(list, TaskListSubclassProp))
-		return true;
+		return true;   // 已经挂过
 
 	auto proc = reinterpret_cast<WNDPROC>(::GetWindowLongPtrW(list, GWLP_WNDPROC));
 	::SetPropW(list, TaskListSubclassProp, reinterpret_cast<HANDLE>(proc));
 	::SetWindowLongPtrW(list, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(TaskListProc));
-	_log.info(L"[PROBE] MSTaskListWClass hooked hwnd=0x%x", (unsigned)(ULONG_PTR)list);
+	_log.info(L"[BTN] hooked taskbar list hwnd=0x%x tray=0x%x",
+			  (unsigned)(ULONG_PTR)list, (unsigned)(ULONG_PTR)tray);
 	return true;
 }
 
+// 挂上**所有**任务栏：主任务栏 + 每个副屏任务栏（Win10 多屏时每屏一个 Shell_SecondaryTrayWnd）。
+static int tasklist_hook_all_now()
+{
+	int hooked = 0;
+	if(tasklist_hook_window(::FindWindowW(Windows::WC_Shell_TrayWnd, nullptr)))
+		hooked++;
+
+	for(HWND prev = nullptr;;)
+	{
+		auto sec = ::FindWindowExW(nullptr, prev, Windows::WC_Shell_SecondaryTrayWnd, nullptr);
+		if(!sec)
+			break;
+		if(tasklist_hook_window(sec))
+			hooked++;
+		prev = sec;
+	}
+	return hooked;
+}
+
+// 启动后先重试若干次（explorer 刚起来时任务栏可能还没建好；delay 为尝试间隔），
+// 成功之后转成**长期巡检**：任务栏窗口被就地重建时（改 DPI / 插拔显示器 / 切主题）
+// subclass 会跟着丢，这里负责重新挂上 —— 否则按钮菜单会静默退回原生 XAML 跳转列表。
+// 只有真的新挂上时才写日志，巡检本身是静默的。
 static void tasklist_hook_all(uint32_t delay)
 {
 	std::thread([delay]()
@@ -1640,10 +1661,16 @@ static void tasklist_hook_all(uint32_t delay)
 		for(int i = 0; i < 15; ++i)
 		{
 			::Sleep(delay);
-			if(tasklist_hook())
+			if(tasklist_hook_all_now() > 0)
 				break;
 		}
-		_log.info(L"[PROBE] tasklist_hook_all thread finished");
+		_log.info(L"[BTN] tasklist hook ready");
+
+		for(;;)
+		{
+			::Sleep(3000);
+			tasklist_hook_all_now();
+		}
 	}).detach();
 }
 

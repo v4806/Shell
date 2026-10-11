@@ -179,6 +179,9 @@ std::unordered_map<HWND, Window> _window_taskbar;
 
 LRESULT __stdcall TaskbarSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
 LRESULT __stdcall TaskbarProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+// [PROBE] Win10 任务栏按钮区（MSTaskListWClass）探针
+LRESULT __stdcall TaskListProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+static void tasklist_hook_all(uint32_t delay);
 
 __inline auto is_registered() -> bool
 {
@@ -382,6 +385,273 @@ struct taskbar_t
 	}
 };
 
+// ===== Win10 任务栏按钮（MSTaskListWClass）右键接管 =====
+// 前置：这两个符号原本定义/声明在本文件更靠后的位置（约 515 行）
+extern bool is_in_taskbar;
+BOOL WINAPI TrackPopupMenuExProc(HMENU hMenu, uint32_t uFlags, int x, int y, HWND hWnd, LPTPMPARAMS lptpm);
+// 注意：subclass 标记不能沿用 UxSubclass —— ContextMenu::Initialize() 里会用
+// `if(0 == ::GetPropW(hwnd.owner, UxSubclass))` 判断该窗口是否已由 Shell 处理过，
+// 命中就【跳过 build_system_menuitems】，于是我们传进去的菜单项会被完全忽略。
+constexpr auto TaskListSubclassProp = L"ShellTaskListSubclass";
+
+// 原理：Win10 的按钮菜单是 ShellExperienceHost 的 XAML 跳转列表（不是 Win32 菜单），Hook 不到。
+// 这里直接 subclass 任务栏按钮区窗口，拦下 WM_CONTEXTMENU 并吞掉，然后自己造一个 HMENU 交给 Shell：
+// Shell 会抓快照并按自己的主题重绘 → 菜单变成 Shell 样式，而内容由我们决定。
+struct taskbar_button_info
+{
+	// 注意：UIA 对任务栏按钮返回的 pid 是 shell 进程，不是应用进程，不能用来定位窗口
+	int pid{};
+	HWND window{};
+	string title;   // 形如 "任务管理器 - 1 个运行窗口"
+};
+
+static taskbar_button_info query_taskbar_button(const Point &pt)
+{
+	taskbar_button_info out;
+	if(!taskbar_t::_IUIAutomation)
+		taskbar_t::_IUIAutomation.CreateInstance(__uuidof(CUIAutomation), CLSCTX_INPROC_SERVER);
+	if(!taskbar_t::_IUIAutomation)
+		return out;
+
+	IComPtr<IUIAutomationElement> elem;
+	if(FAILED(taskbar_t::_IUIAutomation->ElementFromPoint(pt, elem)) || !elem)
+		return out;
+
+	BSTR name = nullptr;
+	elem->get_CurrentName(&name);
+	if(name)
+	{
+		out.title = name;
+		DLL::Invoke(L"OleAut32.dll", "SysFreeString", name);
+	}
+	int epid = 0;
+	elem->get_CurrentProcessId(&epid);
+	out.pid = epid;
+	return out;
+}
+
+struct taskbar_window_finder
+{
+	string keyword;   // 从按钮名解析出的应用名关键词
+	HWND hwnd{};
+};
+
+// 任务栏按钮的名字形如 "任务管理器 - 1 个运行窗口" / "QQ"，
+// 取 " - " 之前的部分作为关键词，三级回退匹配：标题精确 → 标题包含 → 进程名相同。
+static BOOL CALLBACK find_app_window_proc(HWND hWnd, LPARAM lParam)
+{
+	auto f = reinterpret_cast<taskbar_window_finder *>(lParam);
+	if(f->hwnd)
+		return FALSE;
+	if(!::IsWindowVisible(hWnd) || ::GetWindow(hWnd, GW_OWNER))
+		return TRUE;
+	if(::GetWindowLongPtrW(hWnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)
+		return TRUE;
+
+	wchar_t title[512]{};
+	int tlen = ::GetWindowTextW(hWnd, title, 512);
+
+	const wchar_t *btn = f->keyword.c_str();
+	const wchar_t *sep = ::wcsstr(btn, L" - ");
+	size_t n = sep ? static_cast<size_t>(sep - btn) : ::wcslen(btn);
+	if(n == 0 || n >= 256)
+		return TRUE;
+	wchar_t key[256]{};
+	::wcsncpy_s(key, 256, btn, n);
+
+	// 1) 标题精确匹配（如 "任务管理器"）
+	if(tlen > 0 && ::_wcsicmp(title, key) == 0)
+	{
+		f->hwnd = hWnd;
+		return FALSE;
+	}
+
+	// 2) 标题包含（如浏览器 "<页面标题> — DeepSeek Harness"）
+	if(tlen > 0 && ::wcsstr(title, key))
+	{
+		f->hwnd = hWnd;
+		return FALSE;
+	}
+
+	// 3) 进程名相同（如 QQ.exe / WeChat.exe；按钮名就是进程名）
+	DWORD pid = 0;
+	::GetWindowThreadProcessId(hWnd, &pid);
+	if(pid)
+	{
+		wchar_t path[MAX_PATH]{};
+		if(HANDLE hProcess = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid))
+		{
+			DWORD size = MAX_PATH;
+			if(::QueryFullProcessImageNameW(hProcess, 0, path, &size))
+			{
+				const wchar_t *file = ::wcsrchr(path, L'\\');
+				file = file ? file + 1 : path;
+				wchar_t base[MAX_PATH]{};
+				::wcsncpy_s(base, MAX_PATH, file, MAX_PATH);
+				if(wchar_t *dot = ::wcsrchr(base, L'.'))
+					*dot = 0;
+				if(::_wcsicmp(base, key) == 0)
+					f->hwnd = hWnd;
+			}
+			::CloseHandle(hProcess);
+		}
+	}
+	return f->hwnd ? FALSE : TRUE;
+}
+
+static HWND find_app_window(string const &button_name)
+{
+	if(button_name.empty())
+		return nullptr;
+	taskbar_window_finder f;
+	f.keyword = button_name;
+	::EnumWindows(find_app_window_proc, reinterpret_cast<LPARAM>(&f));
+	return f.hwnd;
+}
+
+static void show_taskbar_button_menu(HWND hWnd, const Point &pt)
+{
+	auto info = query_taskbar_button(pt);
+	if(!info.pid)
+	{
+		_log.info(L"[BTN] no pid at (%d,%d)", pt.x, pt.y);
+		return;
+	}
+	info.window = find_app_window(info.title);
+
+	HMENU menu = ::CreatePopupMenu();
+	if(!menu)
+		return;
+
+	const UINT id_pin = 0x1001;
+	const UINT id_close = 0x1002;
+
+	// 源码文件无 BOM，MSVC 按 GBK(936) 解析源文件，中文字面量必须用 \u 转义，
+	// 否则会乱码："固定到任务栏" → "鏁哄畾鍒颁换鍔℃爮"
+	const wchar_t *text_pin = L"\u56FA\u5B9A\u5230\u4EFB\u52A1\u680F";   // 固定到任务栏
+	const wchar_t *text_close = L"\u5173\u95ED\u7A97\u53E3";             // 关闭窗口
+
+	auto title = info.title.empty() ? string(L"Application") : info.title;
+	::AppendMenuW(menu, MF_STRING, 0, title.c_str());
+	::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+	::AppendMenuW(menu, MF_STRING, id_pin, text_pin);
+	::AppendMenuW(menu, MF_STRING, id_close, text_close);
+
+	_log.info(L"[BTN] pid=%d window=0x%x class='%s' title='%s'",
+		info.pid, (unsigned)(ULONG_PTR)info.window,
+		info.window ? Window::class_name(info.window).c_str() : L"<null>",
+		info.title.c_str());
+
+	// 菜单必须先拿到前台/焦点：否则键盘导航无效，鼠标第一次点击只当"激活"，
+	// 且任何进程抢焦点都会把菜单关掉（返回 0）。
+	if(auto root = ::GetAncestor(hWnd, GA_ROOT))
+		::SetForegroundWindow(root);
+	::SetForegroundWindow(hWnd);
+
+	is_in_taskbar = true;
+	auto cmd = TrackPopupMenuExProc(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, hWnd, nullptr);
+	is_in_taskbar = false;
+
+	_log.info(L"[BTN] command=%d", static_cast<int>(cmd));
+
+	if(cmd == id_close && info.window)
+	{
+		// UWP 应用（设置 / 商店等）里层的 Windows.UI.Core.CoreWindow 不响应 SC_CLOSE，
+		// 必须把关闭消息发给顶层宿主（ApplicationFrameWindow）。
+		auto target = ::GetAncestor(info.window, GA_ROOT);
+		if(!target)
+			target = info.window;
+		_log.info(L"[BTN] close window=0x%x target=0x%x", (unsigned)(ULONG_PTR)info.window, (unsigned)(ULONG_PTR)target);
+		::PostMessageW(target, WM_SYSCOMMAND, SC_CLOSE, 0);
+	}
+	else if(cmd == id_pin)
+	{
+		wchar_t path[MAX_PATH]{};
+		if(auto hProcess = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(info.pid)))
+		{
+			DWORD size = MAX_PATH;
+			if(!::QueryFullProcessImageNameW(hProcess, 0, path, &size))
+				path[0] = 0;
+			::CloseHandle(hProcess);
+		}
+		_log.info(L"[BTN] pin '%s'", path);
+		if(path[0])
+		{
+			SHELLEXECUTEINFOW sei{};
+			sei.cbSize = sizeof(sei);
+			sei.fMask = SEE_MASK_INVOKEIDLIST | SEE_MASK_FLAG_NO_UI;
+			sei.lpVerb = L"pin to taskbar";
+			sei.lpFile = path;
+			sei.nShow = SW_SHOWNORMAL;
+			if(!::ShellExecuteExW(&sei))
+				_log.info(L"[BTN] pin failed err=%d", (int)::GetLastError());
+		}
+	}
+
+	::DestroyMenu(menu);
+}
+
+LRESULT __stdcall TaskListProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+	auto proc = reinterpret_cast<WNDPROC>(::GetPropW(hWnd, TaskListSubclassProp));
+	if(!proc)
+		return ::DefWindowProcW(hWnd, uMsg, wParam, lParam);
+
+	switch(uMsg)
+	{
+		case WM_CONTEXTMENU:
+		{
+			auto pt = Point::CursorPos();
+			_log.info(L"[BTN] WM_CONTEXTMENU cursor=(%d,%d)", pt.x, pt.y);
+			show_taskbar_button_menu(hWnd, pt);
+			return 0;   // 吞掉，阻止 ShellExperienceHost 的 XAML 跳转列表
+		}
+	}
+	return ::CallWindowProcW(proc, hWnd, uMsg, wParam, lParam);
+}
+
+static bool tasklist_hook()
+{
+	auto tray = ::FindWindowW(Windows::WC_Shell_TrayWnd, nullptr);
+	_log.info(L"[PROBE] step1 tray=0x%x", (unsigned)(ULONG_PTR)tray);
+	if(!tray)
+		return false;
+	auto rebar = ::FindWindowExW(tray, nullptr, Windows::WC_ReBarWindow32, nullptr);
+	_log.info(L"[PROBE] step2 rebar=0x%x", (unsigned)(ULONG_PTR)rebar);
+	if(!rebar)
+		return false;
+	auto sw = ::FindWindowExW(rebar, nullptr, Windows::WC_MSTaskSwWClass, nullptr);
+	_log.info(L"[PROBE] step3 sw=0x%x", (unsigned)(ULONG_PTR)sw);
+	if(!sw)
+		return false;
+	auto list = ::FindWindowExW(sw, nullptr, Windows::WC_MSTaskListWClass, nullptr);
+	_log.info(L"[PROBE] step4 list=0x%x", (unsigned)(ULONG_PTR)list);
+	if(!list)
+		return false;
+	if(::GetPropW(list, TaskListSubclassProp))
+		return true;
+
+	auto proc = reinterpret_cast<WNDPROC>(::GetWindowLongPtrW(list, GWLP_WNDPROC));
+	::SetPropW(list, TaskListSubclassProp, reinterpret_cast<HANDLE>(proc));
+	::SetWindowLongPtrW(list, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(TaskListProc));
+	_log.info(L"[PROBE] MSTaskListWClass hooked hwnd=0x%x", (unsigned)(ULONG_PTR)list);
+	return true;
+}
+
+static void tasklist_hook_all(uint32_t delay)
+{
+	std::thread([delay]()
+	{
+		for(int i = 0; i < 15; ++i)
+		{
+			::Sleep(delay);
+			if(tasklist_hook())
+				break;
+		}
+		_log.info(L"[PROBE] tasklist_hook_all thread finished");
+	}).detach();
+}
+
 HRESULT __stdcall CoCreateInstanceHook(REFCLSID rclsid, LPUNKNOWN pUnkOuter, DWORD dwClsContext, REFIID riid, LPVOID *ppv)
 {
 	auto is_local_server = (dwClsContext & CLSCTX_LOCAL_SERVER) != 0;
@@ -518,16 +788,6 @@ bool is_in_taskbar;
 BOOL WINAPI TrackPopupMenuProc(HMENU hMenu, uint32_t uFlags, int x, int y, int nReserved, HWND hWnd, const RECT *prcRect);
 BOOL WINAPI TrackPopupMenuExProc(HMENU hMenu, uint32_t uFlags, int x, int y, HWND hWnd, LPTPMPARAMS lptpm);
 
-// [DIAG] 必须放在独立函数里：NtUserTrackPopupMenu 带 __try，函数体内不能出现需要对象展开的代码
-static void diag_log_popup_enter(int tfunc, HWND hWnd, HMENU hMenu, bool in_taskbar)
-{
-	_log.info(L"[DIAG] NtUserTrackPopupMenu enter tfunc=%d class='%s' items=%d in_taskbar=%d",
-		tfunc,
-		hWnd ? Window::class_name(hWnd).c_str() : L"<null>",
-		hMenu ? ::GetMenuItemCount(hMenu) : -1,
-		in_taskbar ? 1 : 0);
-}
-
 BOOL WINAPI NtUserTrackPopupMenu(HMENU hMenu, uint32_t uFlags, int x, int y, HWND hWnd, LPTPMPARAMS lptpm, int tfunc)
 {
 #ifdef _DIJA
@@ -537,8 +797,6 @@ BOOL WINAPI NtUserTrackPopupMenu(HMENU hMenu, uint32_t uFlags, int x, int y, HWN
 	auto result = FALSE;
 	auto invoked = false;
 
-	// [DIAG] Shell 接管入口：进入这里说明 hook 拦到了（tfunc: 0=TrackPopupMenu, 1=Ex/win32u）
-	diag_log_popup_enter(tfunc, hWnd, hMenu, is_in_taskbar);
 
 	auto invoke = [&](HMENU hmenu, uint32_t flag, Point pt)
 	{
@@ -680,11 +938,6 @@ BOOL WINAPI NtUserTrackPopupMenu(HMENU hMenu, uint32_t uFlags, int x, int y, HWN
 BOOL WINAPI TrackPopupMenuProc(HMENU hMenu, uint32_t uFlags, int x, int y, [[maybe_unused]] int nReserved, HWND hWnd, [[maybe_unused]] const RECT *prcRect)
 {
 	//_log.write(L"%s\n", Window::class_name(hWnd).c_str());
-	// [DIAG] 判断任务栏按钮菜单是否走到「无 Ex」的 TrackPopupMenu 路径
-	_log.info(L"[DIAG] TrackPopupMenu(no-Ex) class='%s' owner='%s' items=%d",
-		hWnd ? Window::class_name(hWnd).c_str() : L"<null>",
-		hWnd ? Window::class_name(::GetAncestor(hWnd, GA_ROOTOWNER)).c_str() : L"<null>",
-		hMenu ? ::GetMenuItemCount(hMenu) : -1);
 	return NtUserTrackPopupMenu(hMenu, uFlags, x, y, hWnd, nullptr, 0);
 }
 
@@ -692,11 +945,6 @@ BOOL WINAPI TrackPopupMenuProc(HMENU hMenu, uint32_t uFlags, int x, int y, [[may
 BOOL WINAPI TrackPopupMenuExProc(HMENU hMenu, uint32_t uFlags, int x, int y, HWND hWnd, LPTPMPARAMS lptpm)
 {
 	//_log.write(L"%s\n", Window::class_name(hWnd).c_str());
-	// [DIAG] Ex 路径（含 win32u 的 NtUserTrackPopupMenuEx hook 转发）
-	_log.info(L"[DIAG] TrackPopupMenuEx class='%s' owner='%s' items=%d",
-		hWnd ? Window::class_name(hWnd).c_str() : L"<null>",
-		hWnd ? Window::class_name(::GetAncestor(hWnd, GA_ROOTOWNER)).c_str() : L"<null>",
-		hMenu ? ::GetMenuItemCount(hMenu) : -1);
 	return NtUserTrackPopupMenu(hMenu, uFlags, x, y, hWnd, lptpm, 1);
 }
 
@@ -1063,12 +1311,14 @@ BOOL APIENTRY DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID)
 					//m->init(hModule, "api-ms-win-core-com-l1-1-0.dll", ::CoCreateInstance, CoCreateInstanceProc).install();
 					_CoCreateInstance.Commit();
 
-					// [FIX] Win10 任务栏按钮菜单漏网：
-					// 原逻辑只在 win32u hook 安装失败时才装 IAT hook，而 win32u 上只 hook 了带 Ex 的
-					// NtUserTrackPopupMenuEx；任务栏按钮菜单走的是【无 Ex】的 TrackPopupMenu /
-					// NtUserTrackPopupMenu 路径（实测：弹出该菜单时三个 hook 入口一条日志都没有）。
-					// 改为无条件安装 IAT hook（含 user32!TrackPopupMenu 与 TrackPopupMenuEx）。
-					std::thread([=]() { ::Sleep(2000); hook(); }).detach();
+					// [注] 曾试过「无条件安装 IAT hook」（方案 B），实测：
+					//   1) 对任务栏按钮菜单无效（它不走 user32!TrackPopupMenu）；
+					//   2) 会破坏 explorer 的系统菜单填充（桌面菜单只剩配置项，系统项全丢）。
+					// 故回退为官方原有条件。
+					if(!iathook_NtUserTrackPopupMenuEx.installed())
+					{
+						std::thread([=]() { ::Sleep(2000); hook(); }).detach();
+					}
 
 					if(ver->IsWindows11OrGreater())
 					{
@@ -1098,6 +1348,11 @@ BOOL APIENTRY DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID)
 						*/
 
 						taskbar_t::hook_all(1000);
+					}
+					else
+					{
+						// [PROBE] Win10：任务栏按钮区消息探针（只记录）
+						tasklist_hook_all(1000);
 					}
 				}
 				else if(!iathook_NtUserTrackPopupMenuEx.install())

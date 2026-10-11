@@ -8,10 +8,6 @@ using namespace Nilesoft::Diagnostics;
 
 extern Logger &_log;
 
-// [DIAG] 诊断期：把本文件的 __trace 全部输出到 shell.log（release 构建下 __trace 默认是空的）
-#undef __trace
-#define __trace(...) _log.info(__VA_ARGS__)
-
 #pragma region
 
 /*

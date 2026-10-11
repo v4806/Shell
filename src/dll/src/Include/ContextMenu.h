@@ -811,24 +811,8 @@ plutovg_move_to(pluto, start.x, start.y);
 					ctx->Selected.loader.explorer = explorer;
 					ctx->Selected.loader.contextmenuhandler = contextmenuhandler;
 					if(ctx->Initialize())
-					{
-						// [DIAG]
-						Logger::Info(L"[DIAG] ctx OK class='%s' items=%d",
-							hWnd ? Window::class_name(hWnd).c_str() : L"<null>",
-							hMenu ? ::GetMenuItemCount(hMenu) : -1);
 						return ctx;
-					}
-					// [DIAG]
-					Logger::Info(L"[DIAG] ctx FAILED(Initialize) class='%s' items=%d",
-						hWnd ? Window::class_name(hWnd).c_str() : L"<null>",
-						hMenu ? ::GetMenuItemCount(hMenu) : -1);
 					delete ctx;
-				}
-				else
-				{
-					// [DIAG]
-					Logger::Info(L"[DIAG] ctx SKIP(Disabled) class='%s'",
-						hWnd ? Window::class_name(hWnd).c_str() : L"<null>");
 				}
 				return nullptr;
 			}

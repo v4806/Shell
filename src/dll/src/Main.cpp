@@ -1,4 +1,4 @@
-﻿#include <pch.h>
+#include <pch.h>
 #include "Include/ContextMenu.h"
 #include "Library/detours.h"
 #include "RegistryConfig.h"
@@ -518,6 +518,16 @@ bool is_in_taskbar;
 BOOL WINAPI TrackPopupMenuProc(HMENU hMenu, uint32_t uFlags, int x, int y, int nReserved, HWND hWnd, const RECT *prcRect);
 BOOL WINAPI TrackPopupMenuExProc(HMENU hMenu, uint32_t uFlags, int x, int y, HWND hWnd, LPTPMPARAMS lptpm);
 
+// [DIAG] 必须放在独立函数里：NtUserTrackPopupMenu 带 __try，函数体内不能出现需要对象展开的代码
+static void diag_log_popup_enter(int tfunc, HWND hWnd, HMENU hMenu, bool in_taskbar)
+{
+	_log.info(L"[DIAG] NtUserTrackPopupMenu enter tfunc=%d class='%s' items=%d in_taskbar=%d",
+		tfunc,
+		hWnd ? Window::class_name(hWnd).c_str() : L"<null>",
+		hMenu ? ::GetMenuItemCount(hMenu) : -1,
+		in_taskbar ? 1 : 0);
+}
+
 BOOL WINAPI NtUserTrackPopupMenu(HMENU hMenu, uint32_t uFlags, int x, int y, HWND hWnd, LPTPMPARAMS lptpm, int tfunc)
 {
 #ifdef _DIJA
@@ -526,6 +536,9 @@ BOOL WINAPI NtUserTrackPopupMenu(HMENU hMenu, uint32_t uFlags, int x, int y, HWN
 
 	auto result = FALSE;
 	auto invoked = false;
+
+	// [DIAG] Shell 接管入口：进入这里说明 hook 拦到了（tfunc: 0=TrackPopupMenu, 1=Ex/win32u）
+	diag_log_popup_enter(tfunc, hWnd, hMenu, is_in_taskbar);
 
 	auto invoke = [&](HMENU hmenu, uint32_t flag, Point pt)
 	{
@@ -667,6 +680,11 @@ BOOL WINAPI NtUserTrackPopupMenu(HMENU hMenu, uint32_t uFlags, int x, int y, HWN
 BOOL WINAPI TrackPopupMenuProc(HMENU hMenu, uint32_t uFlags, int x, int y, [[maybe_unused]] int nReserved, HWND hWnd, [[maybe_unused]] const RECT *prcRect)
 {
 	//_log.write(L"%s\n", Window::class_name(hWnd).c_str());
+	// [DIAG] 判断任务栏按钮菜单是否走到「无 Ex」的 TrackPopupMenu 路径
+	_log.info(L"[DIAG] TrackPopupMenu(no-Ex) class='%s' owner='%s' items=%d",
+		hWnd ? Window::class_name(hWnd).c_str() : L"<null>",
+		hWnd ? Window::class_name(::GetAncestor(hWnd, GA_ROOTOWNER)).c_str() : L"<null>",
+		hMenu ? ::GetMenuItemCount(hMenu) : -1);
 	return NtUserTrackPopupMenu(hMenu, uFlags, x, y, hWnd, nullptr, 0);
 }
 
@@ -674,6 +692,11 @@ BOOL WINAPI TrackPopupMenuProc(HMENU hMenu, uint32_t uFlags, int x, int y, [[may
 BOOL WINAPI TrackPopupMenuExProc(HMENU hMenu, uint32_t uFlags, int x, int y, HWND hWnd, LPTPMPARAMS lptpm)
 {
 	//_log.write(L"%s\n", Window::class_name(hWnd).c_str());
+	// [DIAG] Ex 路径（含 win32u 的 NtUserTrackPopupMenuEx hook 转发）
+	_log.info(L"[DIAG] TrackPopupMenuEx class='%s' owner='%s' items=%d",
+		hWnd ? Window::class_name(hWnd).c_str() : L"<null>",
+		hWnd ? Window::class_name(::GetAncestor(hWnd, GA_ROOTOWNER)).c_str() : L"<null>",
+		hMenu ? ::GetMenuItemCount(hMenu) : -1);
 	return NtUserTrackPopupMenu(hMenu, uFlags, x, y, hWnd, lptpm, 1);
 }
 
@@ -1040,10 +1063,12 @@ BOOL APIENTRY DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID)
 					//m->init(hModule, "api-ms-win-core-com-l1-1-0.dll", ::CoCreateInstance, CoCreateInstanceProc).install();
 					_CoCreateInstance.Commit();
 
-					if(!iathook_NtUserTrackPopupMenuEx.installed())
-					{
-						std::thread([=]() { ::Sleep(2000); hook(); }).detach();
-					}
+					// [FIX] Win10 任务栏按钮菜单漏网：
+					// 原逻辑只在 win32u hook 安装失败时才装 IAT hook，而 win32u 上只 hook 了带 Ex 的
+					// NtUserTrackPopupMenuEx；任务栏按钮菜单走的是【无 Ex】的 TrackPopupMenu /
+					// NtUserTrackPopupMenu 路径（实测：弹出该菜单时三个 hook 入口一条日志都没有）。
+					// 改为无条件安装 IAT hook（含 user32!TrackPopupMenu 与 TrackPopupMenuEx）。
+					std::thread([=]() { ::Sleep(2000); hook(); }).detach();
 
 					if(ver->IsWindows11OrGreater())
 					{

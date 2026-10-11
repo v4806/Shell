@@ -445,8 +445,25 @@ struct taskbar_window_finder
 	HWND hwnd{};
 };
 
-// 任务栏按钮的名字形如 "任务管理器 - 1 个运行窗口" / "QQ"，
-// 取 " - " 之前的部分作为关键词，三级回退匹配：标题精确 → 标题包含 → 进程名相同。
+// Chromium 系应用（Edge/Chrome）会在窗口标题里插入零宽字符：
+// 实际标题是 "Microsoft<U+200B> Edge"，用 wcsstr 跟 "Microsoft Edge" 匹配必然失败。
+// 比较前先去掉零宽字符、把非断空格换成普通空格。
+static void normalize_for_match(wchar_t *s)
+{
+	if(!s)
+		return;
+	wchar_t *d = s;
+	for(const wchar_t *p = s; *p; ++p)
+	{
+		if(*p == 0x200B || *p == 0x200C || *p == 0x200D || *p == 0xFEFF || *p == 0x2060)
+			continue;
+		*d++ = (*p == 0x00A0) ? L' ' : *p;
+	}
+	*d = 0;
+}
+
+// 任务栏按钮的名字形如 "任务管理器 - 1 个运行窗口"，取 " - " 之前的部分作为关键词，
+// 三级回退匹配：标题精确 → 标题包含 → 进程名相同。
 static BOOL CALLBACK find_app_window_proc(HWND hWnd, LPARAM lParam)
 {
 	auto f = reinterpret_cast<taskbar_window_finder *>(lParam);
@@ -457,6 +474,8 @@ static BOOL CALLBACK find_app_window_proc(HWND hWnd, LPARAM lParam)
 
 	wchar_t title[512]{};
 	int tlen = ::GetWindowTextW(hWnd, title, 512);
+	if(tlen > 0)
+		normalize_for_match(title);
 
 	const wchar_t *btn = f->keyword.c_str();
 	const wchar_t *sep = ::wcsstr(btn, L" - ");
@@ -465,6 +484,7 @@ static BOOL CALLBACK find_app_window_proc(HWND hWnd, LPARAM lParam)
 		return TRUE;
 	wchar_t key[256]{};
 	::wcsncpy_s(key, 256, btn, n);
+	normalize_for_match(key);
 
 	bool matched = false;
 	// 1) 标题精确  2) 标题包含
@@ -517,9 +537,52 @@ static HWND find_app_window(string const &button_name)
 {
 	if(button_name.empty())
 		return nullptr;
+
+	// 按钮名形如 "任务管理器 - 1 个运行窗口" / "Microsoft Edge (2) - 1 个运行窗口"。
+	// 先取 " - " 之前的部分；注意还可能带 " (2)" 这类窗口数/配置文件后缀
+	// （Edge 多配置文件时会出现），它会破坏标题匹配，需要剥掉再试一次。
+	wchar_t key[256]{};
+	const wchar_t *btn = button_name.c_str();
+	const wchar_t *sep = ::wcsstr(btn, L" - ");
+	size_t n = sep ? static_cast<size_t>(sep - btn) : ::wcslen(btn);
+	if(n == 0)
+		return nullptr;
+	if(n >= 256)
+		n = 255;
+	::wcsncpy_s(key, 256, btn, n);
+
 	taskbar_window_finder f;
-	f.keyword = button_name;
+	f.keyword = key;
 	::EnumWindows(find_app_window_proc, reinterpret_cast<LPARAM>(&f));
+	if(f.hwnd)
+		return f.hwnd;
+
+	// 剥离尾部 " (数字)" 再匹配
+	wchar_t stripped[256]{};
+	::wcsncpy_s(stripped, 256, key, 256);
+	if(wchar_t *p = ::wcsrchr(stripped, L'('))
+	{
+		if(p > stripped && *(p - 1) == L' ')
+		{
+			wchar_t *q = p + 1;
+			bool digits = *q != 0;
+			for(; *q && *q != L')'; ++q)
+			{
+				if(*q < L'0' || *q > L'9')
+				{
+					digits = false;
+					break;
+				}
+			}
+			if(digits && *q == L')' && *(q + 1) == 0)
+			{
+				*(p - 1) = 0;
+				f.hwnd = nullptr;
+				f.keyword = stripped;
+				::EnumWindows(find_app_window_proc, reinterpret_cast<LPARAM>(&f));
+			}
+		}
+	}
 	return f.hwnd;
 }
 

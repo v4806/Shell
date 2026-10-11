@@ -1,4 +1,4 @@
-#include <pch.h>
+﻿#include <pch.h>
 #include "Resource.h"
 #include "Expression\Constants.h"
 #include "Expression\Variable.h"
@@ -9,9 +9,9 @@
 
 #include <regex>
 
-// 定义在 Main.cpp：杀掉任务栏「应用按钮」菜单当前对应窗口的进程树（command.kill_process_tree）。
+// Defined in Main.cpp: kills the process tree of the windows of the current taskbar button menu.
 extern bool kill_taskbar_button_process_tree();
-// 定义在 Main.cpp：按钮菜单当前匹配到的顶层窗口（window.taskbar_button_windows）。
+// Defined in Main.cpp: top-level windows matched by the current button menu (window.taskbar_button_windows).
 extern std::vector<HWND> taskbar_button_windows;
 
 //#include <filesystem>
@@ -1466,19 +1466,19 @@ namespace Nilesoft
 								_result = sel->Window.desktop;
 								break;
 							case IDENT_IS_TASKBAR:
-								// 按钮菜单虽然也挂在任务栏上，但它有自己的上下文类型
-								// （FSO_TASKBAR_BUTTON），这里返回 false，
-								// 好让 type='taskbar' / window.is_taskbar 写的项（例如「转到」）
-								// 不会跟着跑进按钮菜单。
+								// The button menu also lives on the taskbar but has its own context type
+								// (FSO_TASKBAR_BUTTON), so return false here to keep items written for
+								// type='taskbar' / window.is_taskbar (such as "Go to")
+								// out of the button menu.
 								_result = (sel->Window.parent == WINDOW_TASKBAR) && !(sel->Types[FSO_TASKBAR_BUTTON] > 0);
 								break;
 							case IDENT_IS_TASKBAR_BUTTON:
-								// 只对任务栏「应用按钮」的自建菜单为真（见 ContextMenu.cpp 的 WINDOW_TASKBAR 分支）
+								// True only for the self-built taskbar "app button" menu (see the WINDOW_TASKBAR branch).
 								_result = sel->Types[FSO_TASKBAR_BUTTON] > 0;
 								break;
 							case IDENT_TASKBAR_BUTTON_WINDOWS:
-								// 按钮菜单当前匹配到的窗口数：0 表示这个按钮没有可操作的目标
-								// （窗口认不出来 / 应用已退出），配置项可以用它把死项藏掉。
+								// Number of windows matched by the current button menu: 0 means the button has no usable target
+								// (window not recognized / app exited); config items can use it to hide dead entries.
 								_result = static_cast<int>(taskbar_button_windows.size());
 								break;
 							case IDENT_IS_EXPLORER:
@@ -1737,7 +1737,7 @@ namespace Nilesoft
 							_result = Windows::Explorer::Restart();
 							break;
 						case IDENT_COMMAND_KILL_PROCESS_TREE:
-							// 结束该任务栏按钮对应窗口的进程树（按钮菜单由 command.kill_process_tree 提供该项）
+							// Kill the process tree of the windows of this taskbar button (menu item provided by command.kill_process_tree)
 							_result = kill_taskbar_button_process_tree();
 							break;
 						case IDENT_COMMAND_TOGGLEHIDDEN:

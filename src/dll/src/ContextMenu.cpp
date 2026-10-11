@@ -1111,11 +1111,10 @@ namespace Nilesoft
 			
 			std::vector<MenuItemInfo *> bottom_items;
 
-			// 任务栏「应用按钮」自建菜单不加载 .nss 配置项（标志见 Main.cpp 的 in_taskbar_button_menu）。
-			// 配置里新增的 menu(...)/item(...) 就是这一步加进来的 —— 例如「转到」（imports/goto.nss），
-			// 对单个应用按钮没有意义。注意这与下面 build_main_system_menuitems 那条是**两个不同入口**：
-			// 这里管「新增项」，那里管 modify(...) 这类「修改已有项」的规则。
-			if(_settings.new_items.enabled && !in_taskbar_button_menu)
+			// 配置里新增的 menu(...)/item(...) 就是这一步加进来的。按钮菜单同样吃这一套：
+			// 它已是独立类型（FSO_TASKBAR_BUTTON），普通 taskbar 项不会命中它，
+			// 所以这里不再需要按 in_taskbar_button_menu 屏蔽。
+			if(_settings.new_items.enabled)
 			{
 				if(!(owner && owner->is_disabled()))
 				{
@@ -1202,7 +1201,7 @@ namespace Nilesoft
 							else 
 							{
 								bool rb = !Selected.Background && (Selected.Window.id == WINDOW_RECYCLEBIN);
-								if(!Selected.Types[FSO_TASKBAR] && !rb)
+								if(!Selected.Types[FSO_TASKBAR] && !Selected.Types[FSO_TASKBAR_BUTTON] && !rb)
 								{
 									dynamic_pos = items.size() == 0 ? 1 : findpos();
 								}
@@ -4400,7 +4399,15 @@ namespace Nilesoft
 				switch(Selected.Window.id)
 				{
 					case WINDOW_TASKBAR:
-						Selected.Types[FSO_TASKBAR] = TRUE;
+						// 任务栏「应用按钮」的自建菜单（见 Main.cpp 的 in_taskbar_button_menu）走独立类型位：
+						// 它虽然是任务栏的上下文，但类型标成 FSO_TASKBAR_BUTTON 而不是 FSO_TASKBAR，
+						// 于是「转到」、imports/taskbar.nss 这些已按 type='taskbar'/window.is_taskbar 写好的项
+						// 不会自动涌进按钮菜单；配置里要用 where=window.is_taskbar_button 才能命中。
+						if(in_taskbar_button_menu)
+							Selected.Types[FSO_TASKBAR_BUTTON] = TRUE;
+						else
+							Selected.Types[FSO_TASKBAR] = TRUE;
+						// front 保持 FSO_TASKBAR：按钮菜单此前也是这个值，避免影响依赖它的显示逻辑。
 						Selected.front = FSO_TASKBAR;
 						Selected.Directory = Path::GetKnownFolder(FOLDERID_Desktop).move();
 						break;
@@ -4477,10 +4484,9 @@ namespace Nilesoft
 				if(0 == ::GetPropW(hwnd.owner, UxSubclass))
 					build_system_menuitems(_hMenu_original, __system_menu_tree, true);
 
-				// 任务栏「应用按钮」的自建菜单里不加载 .nss 配置项 —— 例如「转到」对单个应用按钮
-				// 没有意义（这些项由 _cache->statics 应用，就是这一步）。
-				// 任务栏空白处 / 桌面 / 文件菜单不走这条自建菜单路径，行为不变。
-				if(_settings.modify_items.enabled && !in_taskbar_button_menu)
+				// modify(...) 这类「修改已有项」的规则同样允许作用到按钮菜单（它已是独立类型，
+				// 通用 taskbar 规则不会误伤），因此不再按 in_taskbar_button_menu 屏蔽。
+				if(_settings.modify_items.enabled)
 					build_main_system_menuitems(__system_menu_tree, true);
 
 				return true;

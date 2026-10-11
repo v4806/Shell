@@ -43,6 +43,9 @@ namespace Nilesoft
 
 			FSO_SIZE,
 			FSO_NAMESPACE_LIBRARIES,
+			// 任务栏「应用按钮」自建菜单的上下文类型（与 FSO_NAMESPACE_LIBRARIES 一样放在 FSO_SIZE 之后：
+			// 不进 fs_types 表，也不改动任何既有 FSO_* 的枚举值）。
+			FSO_TASKBAR_BUTTON,
 			FSO_COUNT,
 			FSO_MAX
 		};

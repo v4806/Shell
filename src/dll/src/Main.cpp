@@ -392,6 +392,8 @@ struct taskbar_t
 // 前置：这两个符号原本定义/声明在本文件更靠后的位置（约 515 行）
 extern bool is_in_taskbar;
 extern bool in_taskbar_button_menu;
+// 定义在文件后部（约 1630 行），此处前置声明给按钮菜单与 command.kill_process_tree 用
+extern std::vector<HWND> taskbar_button_windows;
 BOOL WINAPI TrackPopupMenuExProc(HMENU hMenu, uint32_t uFlags, int x, int y, HWND hWnd, LPTPMPARAMS lptpm);
 // 注意：subclass 标记不能沿用 UxSubclass —— ContextMenu::Initialize() 里会用
 // `if(0 == ::GetPropW(hwnd.owner, UxSubclass))` 判断该窗口是否已由 Shell 处理过，
@@ -542,6 +544,74 @@ static bool appsfolder_display_name(const wchar_t *aumid_or_path, wchar_t *out, 
 	return ok;
 }
 
+// exe 全路径查不到时的兜底：AppsFolder 里的项**不一定**拿 exe 全路径当键 ——
+// 例如 cmd.exe 是 shell:AppsFolder\{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\cmd.exe
+// （System32 的 KNOWNFOLDERID），拿 C:\Windows\system32\cmd.exe 去查必然失败。
+// 所以这里按 exe 文件名在 AppsFolder 里找同名项，取它的显示名（cmd.exe → 「命令提示符」）。
+// 整张表只建一次并缓存。
+static const std::map<std::wstring, std::wstring> &appsfolder_name_map()
+{
+	static std::once_flag once;
+	static std::map<std::wstring, std::wstring> cache;
+	std::call_once(once, []()
+	{
+		IShellItem *folder = nullptr;
+		if(FAILED(::SHCreateItemFromParsingName(L"shell:AppsFolder", nullptr, IID_IShellItem,
+												reinterpret_cast<void **>(&folder))) || !folder)
+			return;
+
+		IEnumShellItems *en = nullptr;
+		if(SUCCEEDED(folder->BindToHandler(nullptr, BHID_EnumItems, IID_IEnumShellItems,
+										   reinterpret_cast<void **>(&en))) && en)
+		{
+			IShellItem *child = nullptr;
+			while(en->Next(1, &child, nullptr) == S_OK)
+			{
+				LPWSTR path = nullptr;
+				if(SUCCEEDED(child->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &path)) && path)
+				{
+					const wchar_t *file = ::wcsrchr(path, L'\\');
+					file = file ? file + 1 : path;
+					if(file[0] && cache.find(file) == cache.end())
+					{
+						LPWSTR name = nullptr;
+						if(SUCCEEDED(child->GetDisplayName(SIGDN_NORMALDISPLAY, &name)) && name)
+						{
+							cache[file] = name;
+							::CoTaskMemFree(name);
+						}
+					}
+					::CoTaskMemFree(path);
+				}
+				child->Release();
+			}
+			en->Release();
+		}
+		folder->Release();
+	});
+	return cache;
+}
+
+static bool appsfolder_display_name_by_exe_filename(const wchar_t *exe_path, wchar_t *out, size_t outLen)
+{
+	out[0] = 0;
+	if(!exe_path || !exe_path[0])
+		return false;
+
+	const wchar_t *file = ::wcsrchr(exe_path, L'\\');
+	file = file ? file + 1 : exe_path;
+	if(!file[0])
+		return false;
+
+	auto &map = appsfolder_name_map();
+	auto it = map.find(file);
+	if(it == map.end())
+		return false;
+
+	::wcsncpy_s(out, outLen, it->second.c_str(), outLen - 1);
+	return out[0] != 0;
+}
+
 // 这个窗口在任务栏上叫的名字：先按 AUMID 查 AppsFolder，查不到再按 exe 路径查
 static bool window_button_name(HWND hWnd, wchar_t *out, size_t outLen)
 {
@@ -560,9 +630,16 @@ static bool window_button_name(HWND hWnd, wchar_t *out, size_t outLen)
 		return false;
 	wchar_t exe[MAX_PATH]{};
 	DWORD size = MAX_PATH;
-	bool ok = ::QueryFullProcessImageNameW(hp, 0, exe, &size) && appsfolder_display_name(exe, out, outLen);
+	bool ok = ::QueryFullProcessImageNameW(hp, 0, exe, &size) != FALSE;
 	::CloseHandle(hp);
-	return ok;
+	if(!ok)
+		return false;
+
+	if(appsfolder_display_name(exe, out, outLen))
+		return true;
+
+	// 控制台（cmd.exe）这类：AppsFolder 里不是用 exe 全路径当键，按文件名再找一次。
+	return appsfolder_display_name_by_exe_filename(exe, out, outLen);
 }
 
 // 「文件资源管理器」是唯一必须特判的应用：它的窗口**一个 AppUserModel 属性都不带**
@@ -1402,6 +1479,9 @@ static void show_taskbar_button_menu(HWND hWnd, const Point &pt, taskbar_button_
 		::SetForegroundWindow(root);
 	::SetForegroundWindow(hWnd);
 
+	// 供 command.kill_process_tree 用（见下）：按钮菜单当前对应的顶层窗口，已按 GA_ROOT 去重。
+	taskbar_button_windows = close_targets;
+
 	is_in_taskbar = true;
 	in_taskbar_button_menu = true;
 	auto cmd = TrackPopupMenuExProc(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, hWnd, nullptr);
@@ -1431,6 +1511,76 @@ static void show_taskbar_button_menu(HWND hWnd, const Point &pt, taskbar_button_
 	}
 
 	::DestroyMenu(menu);
+}
+
+// command.kill_process_tree 的实现（FuncExpression.cpp 里 extern 调用）：
+// 杀掉按钮菜单当前对应窗口的进程树。顺序很关键 —— 先按 Toolhelp 快照把后代全部展开，
+// 再从叶子往根终止：反过来先杀父进程的话，子进程会被系统改挂到别的父上，杀树就漏了。
+bool kill_taskbar_button_process_tree()
+{
+	std::vector<uint32_t> roots;
+	for(auto hwnd : taskbar_button_windows)
+	{
+		if(!::IsWindow(hwnd))
+			continue;
+		DWORD pid = 0;
+		::GetWindowThreadProcessId(hwnd, &pid);
+		if(pid == 0)
+			continue;
+		bool seen = false;
+		for(auto r : roots)
+		{
+			if(r == pid)
+			{
+				seen = true;
+				break;
+			}
+		}
+		if(!seen)
+			roots.push_back(pid);
+	}
+
+	if(roots.empty())
+	{
+		_log.info(L"[KILL] no window/pid for taskbar button (windows=%d)", static_cast<int>(taskbar_button_windows.size()));
+		return false;
+	}
+
+	_log.info(L"[KILL] root pid=%u", roots.front());
+
+	auto snapshot = Diagnostics::Process::EnumInfo();
+
+	std::vector<uint32_t> order;
+	std::function<void(uint32_t)> collect = [&](uint32_t pid)
+	{
+		for(auto done : order)
+			if(done == pid)
+				return;
+		for(auto &p : snapshot)
+		{
+			if(p.th32ProcessID != 0 && p.th32ParentProcessID == pid && p.th32ProcessID != pid)
+				collect(p.th32ProcessID);
+		}
+		order.push_back(pid);
+	};
+
+	for(auto r : roots)
+		collect(r);
+
+	int killed = 0;
+	for(auto pid : order)
+	{
+		if(auto hProcess = ::OpenProcess(PROCESS_TERMINATE, FALSE, pid))
+		{
+			if(::TerminateProcess(hProcess, 0))
+				killed++;
+			::CloseHandle(hProcess);
+		}
+	}
+
+	_log.info(L"[KILL] roots=%d processes=%d killed=%d",
+			  static_cast<int>(roots.size()), static_cast<int>(order.size()), killed);
+	return killed > 0;
 }
 
 LRESULT __stdcall TaskListProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -1630,9 +1780,12 @@ STDAPI WINAPI DllGetClassObjectHook(REFCLSID rclsid, _In_ REFIID riid, LPVOID *p
 #define TPM_SYSMENU	0x0200L
 bool is_in_taskbar;
 // 任务栏「应用按钮」自建菜单期间为 true（见 show_taskbar_button_menu）。
-// ContextMenu 用它决定这次不加载 .nss 配置项 —— 对单个应用按钮来说配置项没有意义
-// （实际会冒出来的就是「转到」）。任务栏空白处 / 桌面 / 文件菜单不走这条路径，不受影响。
+// ContextMenu 用它把这次菜单的上下文类型标成 FSO_TASKBAR_BUTTON（而不是 FSO_TASKBAR），
+// 于是配置项可以用 where=window.is_taskbar_button 精确命中按钮菜单，
+// 而「转到」、imports/taskbar.nss 等既有 taskbar 项不会自动涌进来。
 bool in_taskbar_button_menu;
+// 按钮菜单当前对应的顶层窗口（弹菜单前填好）：command.kill_process_tree 用它杀进程树。
+std::vector<HWND> taskbar_button_windows;
 
 BOOL WINAPI TrackPopupMenuProc(HMENU hMenu, uint32_t uFlags, int x, int y, int nReserved, HWND hWnd, const RECT *prcRect);
 BOOL WINAPI TrackPopupMenuExProc(HMENU hMenu, uint32_t uFlags, int x, int y, HWND hWnd, LPTPMPARAMS lptpm);
